@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	bind    = flag.String("b", "127.0.0.1:8080", "")
-	verbose = flag.Bool("v", false, "")
+	bind    = flag.String("b", "127.0.0.1:8080", "bind address")
+	verbose = flag.Bool("v", false, "show access log")
 )
 
 var (
