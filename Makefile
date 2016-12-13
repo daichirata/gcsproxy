@@ -1,4 +1,4 @@
-VERSION  := 0.1.0
+VERSION  := 0.1.1
 BIN_NAME := bin/gcsproxy
 
 GOFILES_NOVENDOR    := $(shell find . -type f -name '*.go' -not -path "*/vendor/*")
