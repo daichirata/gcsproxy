@@ -1,0 +1,10 @@
+[Unit]
+Description=gcsproxy
+
+[Service]
+Type=simple
+ExecStart=/opt/gcsproxy/gcsproxy -v
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+[Install]
+WantedBy = multi-user.target
