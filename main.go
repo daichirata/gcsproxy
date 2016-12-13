@@ -107,7 +107,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	setStrHeader(w, "Cache-Control", attr.CacheControl)
 	setStrHeader(w, "Content-Encoding", attr.ContentEncoding)
 	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
-	setIntHeader(w, "Content-Length", attr.Size)
+	// setIntHeader(w, "Content-Length", attr.Size)
 	// setTimeHeader(w, "Last-Modified", attr.Updated)
 	// setStrHeader(w, "Expires", attr.Expires)
 	objr, err := obj.NewReader(ctx)
