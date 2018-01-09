@@ -11,11 +11,13 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/gorilla/mux"
+	"google.golang.org/api/option"
 )
 
 var (
-	bind    = flag.String("b", "127.0.0.1:8080", "bind address")
-	verbose = flag.Bool("v", false, "show access log")
+	bind        = flag.String("b", "127.0.0.1:8080", "Bind address")
+	verbose     = flag.Bool("v", false, "Show access log")
+	credentials = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
 )
 
 var (
@@ -57,7 +59,9 @@ func setIntHeader(w http.ResponseWriter, key string, value int64) {
 }
 
 func setTimeHeader(w http.ResponseWriter, key string, value time.Time) {
-	w.Header().Add(key, value.UTC().Format(http.TimeFormat))
+	if !value.IsZero() {
+		w.Header().Add(key, value.UTC().Format(http.TimeFormat))
+	}
 }
 
 type wrapResponseWriter struct {
@@ -107,9 +111,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	setStrHeader(w, "Cache-Control", attr.CacheControl)
 	setStrHeader(w, "Content-Encoding", attr.ContentEncoding)
 	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
-	// setIntHeader(w, "Content-Length", attr.Size)
-	// setTimeHeader(w, "Last-Modified", attr.Updated)
-	// setStrHeader(w, "Expires", attr.Expires)
+	setIntHeader(w, "Content-Length", attr.Size)
 	objr, err := obj.NewReader(ctx)
 	if err != nil {
 		handleError(w, err)
@@ -122,7 +124,11 @@ func main() {
 	flag.Parse()
 
 	var err error
-	client, err = storage.NewClient(ctx)
+	if *credentials != "" {
+		client, err = storage.NewClient(ctx, option.WithCredentialsFile(*credentials))
+	} else {
+		client, err = storage.NewClient(ctx)
+	}
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}

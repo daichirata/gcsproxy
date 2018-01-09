@@ -25,8 +25,10 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 ```
 Usage of gcsproxy:
   -b string
-        bind address (default "127.0.0.1:8080")
-  -v    show access log
+    	Bind address (default "127.0.0.1:8080")
+  -c string
+    	The path to the keyfile. If not present, client will use your default application credentials.
+  -v	Show access log
 ```
 
 **systemd example**
