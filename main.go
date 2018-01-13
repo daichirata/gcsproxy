@@ -12,46 +12,167 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/gorilla/mux"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
-var (
-	bind         = flag.String("bind", "127.0.0.1:8080", "bind address")
-	credentials  = flag.String("credentials", "", "the path to the keyfile. If not present, client will use your default application credentials")
-	signatureKey = flag.String("signature_key", "", "HMAC key used in calculating request signatures")
-	verbose      = flag.Bool("verbose", false, "print verbose logging messages")
-)
-
-var (
-	client *storage.Client
-	ctx    = context.Background()
-)
-
 func main() {
+	var (
+		bind         = flag.String("bind", "127.0.0.1:8080", "bind address")
+		credentials  = flag.String("credentials", "", "the path to the keyfile. If not present, client will use your default application credentials")
+		signatureKey = flag.String("signature_key", "", "HMAC key used in calculating request signatures")
+		accessLog    = flag.Bool("access_log", true, "print access log")
+		verbose      = flag.Bool("verbose", false, "print verbose logging messages")
+	)
 	flag.Parse()
 
+	c := Config{
+		credentials:  *credentials,
+		signatureKey: []byte(*signatureKey),
+		accessLog:    *accessLog,
+		verbose:      *verbose,
+	}
+	proxy, err := NewProxy(c)
+	if err != nil {
+		log.Fatalf("Failed to create proxy: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	proxy.RegisterHandlers(mux)
+
+	log.Printf("[service] listening on %s", *bind)
+	log.Fatal(http.ListenAndServe(*bind, mux))
+}
+
+type Config struct {
+	credentials  string
+	signatureKey []byte
+	accessLog    bool
+	verbose      bool
+}
+
+type Proxy struct {
+	client *storage.Client
+	config Config
+}
+
+func NewProxy(config Config) (*Proxy, error) {
+	ctx := context.Background()
+
+	var client *storage.Client
 	var err error
-	if *credentials != "" {
-		client, err = storage.NewClient(ctx, option.WithCredentialsFile(*credentials))
+
+	if config.credentials != "" {
+		client, err = storage.NewClient(ctx, option.WithCredentialsFile(config.credentials))
 	} else {
 		client, err = storage.NewClient(ctx)
 	}
 	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+		return nil, err
 	}
 
-	r := mux.NewRouter()
-	r.HandleFunc("/{bucket:[0-9a-zA-Z-_]+}/{object:.*}", wrapper(proxy)).Methods("GET", "HEAD")
-
-	log.Printf("[service] listening on %s", *bind)
-	log.Fatal(http.ListenAndServe(*bind, r))
+	return &Proxy{client: client, config: config}, nil
 }
 
-func validateSignature(key string, r *http.Request) error {
+func (p *Proxy) RegisterHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("/favicon.ico", http.NotFound)
+
+	mux.HandleFunc("/health-check", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.Handle("/", p.wrapper(p.proxy))
+}
+
+func (p *Proxy) sendResponse(w http.ResponseWriter, code int, err error) {
+	if p.config.verbose && err != nil {
+		log.Println(err)
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(code)
+	fmt.Fprintln(w, http.StatusText(code))
+}
+
+type wrapResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *wrapResponseWriter) WriteHeader(status int) {
+	w.ResponseWriter.WriteHeader(status)
+	w.status = status
+}
+
+func (p *Proxy) wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		t := time.Now()
+		writer := &wrapResponseWriter{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+		}
+
+		fn(writer, r)
+
+		if p.config.accessLog {
+			addr := r.RemoteAddr
+			if ip, found := header(r, "X-Forwarded-For"); found {
+				addr = ip
+			}
+			log.Printf("[%s] %.3f %d %s %s", addr, time.Now().Sub(t).Seconds(), writer.status, r.Method, r.URL)
+		}
+	}
+}
+
+func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		p.sendResponse(w, http.StatusBadRequest, nil)
+		return
+	}
+
+	if len(p.config.signatureKey) != 0 {
+		if err := validateSignature(p.config.signatureKey, r); err != nil {
+			p.sendResponse(w, http.StatusForbidden, err)
+			return
+		}
+	}
+
+	parts := strings.SplitN(r.URL.Path[1:], "/", 2)
+	bucket := parts[0]
+	object := parts[1]
+
+	o := p.client.Bucket(bucket).Object(object)
+	ctx := context.Background()
+
+	attr, err := o.Attrs(ctx)
+	if err != nil {
+		if e, ok := err.(*googleapi.Error); ok {
+			p.sendResponse(w, e.Code, err)
+			return
+		}
+		p.sendResponse(w, http.StatusInternalServerError, err)
+		return
+	}
+	setStrHeader(w, "Cache-Control", attr.CacheControl)
+	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
+	setStrHeader(w, "Content-Encoding", attr.ContentEncoding)
+	setStrHeader(w, "Content-Language", attr.ContentLanguage)
+	setIntHeader(w, "Content-Length", attr.Size)
+	setStrHeader(w, "Content-Type", attr.ContentType)
+
+	or, err := o.NewReader(ctx)
+	if err != nil {
+		p.sendResponse(w, http.StatusInternalServerError, err)
+		return
+	}
+	io.Copy(w, or)
+}
+
+func validateSignature(key []byte, r *http.Request) error {
 	q := r.URL.Query()
 
 	expires := q.Get("expires")
@@ -69,7 +190,7 @@ func validateSignature(key string, r *http.Request) error {
 	if err != nil {
 		return fmt.Errorf("error base64 decoding signature %q", signature)
 	}
-	mac := hmac.New(sha256.New, []byte(key))
+	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(expires + ":" + r.URL.Path))
 	want := mac.Sum(nil)
 	if !hmac.Equal(got, want) {
@@ -105,82 +226,4 @@ func setTimeHeader(w http.ResponseWriter, key string, value time.Time) {
 	if !value.IsZero() {
 		w.Header().Add(key, value.UTC().Format(http.TimeFormat))
 	}
-}
-
-type wrapResponseWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *wrapResponseWriter) WriteHeader(status int) {
-	w.ResponseWriter.WriteHeader(status)
-	w.status = status
-}
-
-func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		proc := time.Now()
-
-		writer := &wrapResponseWriter{
-			ResponseWriter: w,
-			status:         http.StatusOK,
-		}
-		fn(writer, r)
-
-		if *verbose {
-			addr := r.RemoteAddr
-			if ip, found := header(r, "X-Forwarded-For"); found {
-				addr = ip
-			}
-			log.Printf("[%s] %.3f %d %s %s",
-				addr,
-				time.Now().Sub(proc).Seconds(),
-				writer.status,
-				r.Method,
-				r.URL,
-			)
-		}
-	}
-}
-
-func handleError(w http.ResponseWriter, code int, err error) {
-	log.Println(err)
-	http.Error(w, http.StatusText(code), code)
-}
-
-func proxy(w http.ResponseWriter, r *http.Request) {
-	if *signatureKey != "" {
-		if err := validateSignature(*signatureKey, r); err != nil {
-			handleError(w, http.StatusForbidden, err)
-			return
-		}
-	}
-
-	params := mux.Vars(r)
-	obj := client.Bucket(params["bucket"]).Object(params["object"])
-
-	attr, err := obj.Attrs(ctx)
-	if err != nil {
-		var code int
-		if err == storage.ErrObjectNotExist {
-			code = http.StatusNotFound
-		} else {
-			code = http.StatusInternalServerError
-		}
-		handleError(w, code, err)
-		return
-	}
-	setStrHeader(w, "Content-Type", attr.ContentType)
-	setStrHeader(w, "Content-Language", attr.ContentLanguage)
-	setStrHeader(w, "Cache-Control", attr.CacheControl)
-	setStrHeader(w, "Content-Encoding", attr.ContentEncoding)
-	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
-	setIntHeader(w, "Content-Length", attr.Size)
-
-	objr, err := obj.NewReader(ctx)
-	if err != nil {
-		handleError(w, http.StatusInternalServerError, err)
-		return
-	}
-	io.Copy(w, objr)
 }
