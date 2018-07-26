@@ -5,3 +5,5 @@ RUN apk add --no-cache --virtual .build-deps ca-certificates wget \
   && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy_${GCSPROXY_VERSION}_amd64_linux -O /usr/local/bin/gcsproxy \
   && chmod +x /usr/local/bin/gcsproxy \
   && apk del .build-deps
+
+CMD ["gcsproxy"]
