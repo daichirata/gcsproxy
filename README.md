@@ -7,7 +7,7 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 ```
  +---------------------------------------+
  |                Nginx                  |
- |    access controll (basic auth/ip)    |
+ |    access control (basic auth/ip)     |
  +-----+---------------------------------+
        |
 -----------------------------------------+
