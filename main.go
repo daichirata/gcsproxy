@@ -18,6 +18,7 @@ var (
 	bind          = flag.String("b", "127.0.0.1:8080", "Bind address.")
 	credentials   = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
 	redirect404   = flag.Bool("r", false, "Redirect to index.html if 404 not found.")
+	indexPage     = flag.String("i", "", "Index page file name.")
 	useDomainName = flag.Bool("dn", false, "Use hostname as a bucket name.")
 	useSecret     = flag.String("s", "", "Use SA key from secretManager. E.G. 'projects/937192795301/secrets/gcs-proxy/versions/1'")
 	verbose       = flag.Bool("v", false, "Show access log.")
@@ -110,8 +111,8 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set index page name
-	if params["object"] == "" {
-		params["object"] = "index.html"
+	if *indexPage != "" && params["object"] == "" {
+		params["object"] = *indexPage
 	}
 
 	obj := client.Bucket(params["bucket"]).Object(params["object"])
