@@ -25,24 +25,29 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 ```
 Usage of gcsproxy:
   -b string
-    	Bind address (default "127.0.0.1:8080")
+    	Bind address. (default "127.0.0.1:8080")
   -c string
     	The path to the keyfile. If not present, client will use your default application credentials.
-  -v	Show access log
+  -dn Use hostname as a bucket name.
+  -r	Redirect to index.html if 404 not found.
+  -s string
+    	Use SA key from secretManager. E.G. 'projects/937121755211/secrets/gcs-proxy/versions/1'
+  -v	Show access log.
 
 ```
 
 **Dockerfile example**
 
 ``` dockerfile
-FROM alpine:3.7
+FROM golang:1.14-alpine as build
 
-ENV GCSPROXY_VERSION=0.3.0
-RUN apk add --no-cache --virtual .build-deps ca-certificates wget \
-  && update-ca-certificates \
-  && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy_${GCSPROXY_VERSION}_amd64_linux -O /usr/local/bin/gcsproxy \
-  && chmod +x /usr/local/bin/gcsproxy \
-  && apk del .build-deps
+WORKDIR /app
+COPY . /app
+RUN go build -o dist/gcs-proxy_amd64_linux
+
+FROM alpine:3.13
+COPY --from=build /app/dist/gcs-proxy_amd64_linux /usr/local/bin/gcsproxy
+RUN chmod +x /usr/local/bin/gcsproxy
 
 CMD ["gcsproxy"]
 ```
