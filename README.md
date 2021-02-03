@@ -4,6 +4,14 @@ Reverse proxy for Google Cloud Storage.
 ## Description
 This is a reverse proxy for Google Cloud Storage for performing limited disclosure (IP address restriction etc...). Gets the URL of the GCS object through its internal API. Therefore, it is possible to make GCS objects private and deliver limited content.
 
+## Changes
+These changes make it possible to put a static site in a private GCS bucket behind GLB with IAP.
+Request flow: 
+```
+User ==(https)> GlobalLB with IAP enabled ==(http)> CloudRun GCS-proxy ==(https)> GCS Private bucket
+```
+- Bucket name must be the same as a DNS name since we use the hostname as a key to addressing the right bucket.
+
 ```
  +---------------------------------------+
  |                Nginx                  |
