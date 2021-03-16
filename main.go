@@ -119,7 +119,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	attr, err := obj.Attrs(ctx)
 
 	if err == storage.ErrObjectNotExist && *redirect404 {
-		// remove first slash and add tailing if missing, otherwise it won't find an object
+		// Remove first slash, otherwise it won't find an object. Add tailing slash if missing.
 		u := r.URL.RequestURI()[1:]
 		if l := len(u) - 1; u[l:] != "/" {
 			u = u + "/"
