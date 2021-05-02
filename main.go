@@ -119,7 +119,13 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	attr, err := obj.Attrs(ctx)
 
 	if err == storage.ErrObjectNotExist && *redirect404 {
-		obj = client.Bucket(params["bucket"]).Object("index.html")
+		// Remove first slash, otherwise it won't find an object. Add tailing slash if missing.
+		u := r.URL.RequestURI()[1:]
+		if l := len(u) - 1; u[l:] != "/" {
+			u = u + "/"
+		}
+
+		obj = client.Bucket(params["bucket"]).Object(u + *indexPage)
 		attr, err = obj.Attrs(ctx)
 	}
 
