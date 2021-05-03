@@ -127,12 +127,18 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 
 		obj = client.Bucket(params["bucket"]).Object(u + *indexPage)
 		attr, err = obj.Attrs(ctx)
+
+		if err == storage.ErrObjectNotExist {
+			obj = client.Bucket(params["bucket"]).Object(*indexPage)
+			attr, err = obj.Attrs(ctx)
+		}
 	}
 
 	if err != nil {
 		handleError(w, err)
 		return
 	}
+
 	setStrHeader(w, "Content-Type", attr.ContentType)
 	setStrHeader(w, "Content-Language", attr.ContentLanguage)
 	setStrHeader(w, "Cache-Control", attr.CacheControl)
