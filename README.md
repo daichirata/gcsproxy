@@ -7,12 +7,15 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 ## Changes
 Difference from daichirata/gcsproxy is that is possible to put a static site in a private GCS bucket behind GLB with IAP.
 
-new.
+New.
 - run in CloudRun
 - Pull SA key from secretMAnager
 - redirect 404 to index.html
 - set index page like index.html
 - use host name as a bucket name
+
+Redirect pattern:
+`try_files $uri $uri/index.html /index.html`
 
 Request flow: 
 ```
@@ -36,7 +39,7 @@ User ==(https)> GlobalLB with IAP enabled ==(http)> CloudRun GCS-proxy ==(https)
 +------------+          +---------------+
 ```
 
-## Useage
+## Usage
 
 ```
 Usage of gcsproxy:
@@ -44,6 +47,8 @@ Usage of gcsproxy:
     	Bind address. (default "127.0.0.1:8080")
   -c string
     	The path to the keyfile. If not present, client will use your default application credentials.
+  -i string
+     Index page file name.
   -dn Use hostname as a bucket name.
   -r	Redirect to index.html if 404 not found.
   -s string
@@ -55,7 +60,7 @@ Usage of gcsproxy:
 **Dockerfile example**
 
 ``` dockerfile
-FROM golang:1.14-alpine as build
+FROM golang:1.16-alpine as build
 
 WORKDIR /app
 COPY . /app
