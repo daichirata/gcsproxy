@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -145,11 +144,9 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	setStrHeader(w, "Cache-Control", attr.CacheControl)
 	setStrHeader(w, "Content-Encoding", attr.ContentEncoding)
 	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
+	setStrHeader(w, "X-Goog-Authenticated-User-Id", r.Header.Get("X-Goog-Authenticated-User-Id"))
+	setStrHeader(w, "X-Goog-Authenticated-User-Email", r.Header.Get("X-Goog-Authenticated-User-Email"))
 	setIntHeader(w, "Content-Length", attr.Size)
-
-	for name, values := range r.Header {
-		fmt.Fprintf(w, "%s = %s\n", name, values)
-	}
 
 	objr, err := obj.NewReader(ctx)
 	if err != nil {
