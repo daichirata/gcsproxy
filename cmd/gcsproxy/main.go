@@ -127,18 +127,27 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 
 		obj = client.Bucket(params["bucket"]).Object(u + *indexPage)
 		attr, err = obj.Attrs(ctx)
+
+		if err == storage.ErrObjectNotExist {
+			obj = client.Bucket(params["bucket"]).Object(*indexPage)
+			attr, err = obj.Attrs(ctx)
+		}
 	}
 
 	if err != nil {
 		handleError(w, err)
 		return
 	}
+
 	setStrHeader(w, "Content-Type", attr.ContentType)
 	setStrHeader(w, "Content-Language", attr.ContentLanguage)
 	setStrHeader(w, "Cache-Control", attr.CacheControl)
 	setStrHeader(w, "Content-Encoding", attr.ContentEncoding)
 	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
+	setStrHeader(w, "X-Goog-Authenticated-User-Id", r.Header.Get("X-Goog-Authenticated-User-Id"))
+	setStrHeader(w, "X-Goog-Authenticated-User-Email", r.Header.Get("X-Goog-Authenticated-User-Email"))
 	setIntHeader(w, "Content-Length", attr.Size)
+
 	objr, err := obj.NewReader(ctx)
 	if err != nil {
 		handleError(w, err)
