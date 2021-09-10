@@ -169,6 +169,8 @@ func main() {
 	} else {
 		client, err = storage.NewClient(ctx)
 	}
+	defer client.Close()
+
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
