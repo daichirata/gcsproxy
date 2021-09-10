@@ -1,3 +1,5 @@
+[![Go](https://github.com/mike-sirs/gcsproxy/actions/workflows/go.yml/badge.svg?branch=master)](https://github.com/mike-sirs/gcsproxy/actions/workflows/go.yml)
+
 # gcsproxy
 Reverse proxy for Google Cloud Storage.
 
