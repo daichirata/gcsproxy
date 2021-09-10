@@ -19,7 +19,4 @@ jobs:
         go-version: 1.16
 
     - name: Build
-      run: go build -v ./...
-
-    - name: Test
-      run: go test -v ./...
+      run: go build ./cmd/gcsproxy
