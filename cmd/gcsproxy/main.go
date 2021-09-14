@@ -153,7 +153,11 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
-	io.Copy(w, objr)
+	_, err = io.Copy(w, objr)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
 }
 
 func main() {
@@ -169,7 +173,6 @@ func main() {
 	} else {
 		client, err = storage.NewClient(ctx)
 	}
-	defer client.Close()
 
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
