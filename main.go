@@ -100,23 +100,35 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 
 func proxy(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
-	obj := client.Bucket(params["bucket"]).Object(params["object"])
+	obj := client.Bucket(params["bucket"]).Object(params["object"]).ReadCompressed(false)
 	attr, err := obj.Attrs(ctx)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
-	setStrHeader(w, "Content-Type", attr.ContentType)
-	setStrHeader(w, "Content-Language", attr.ContentLanguage)
-	setStrHeader(w, "Cache-Control", attr.CacheControl)
-	setStrHeader(w, "Content-Encoding", attr.ContentEncoding)
-	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
-	setIntHeader(w, "Content-Length", attr.Size)
+	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
+		last, err := http.ParseTime(lastStrs[0])
+		if *verbose && err != nil {
+			log.Printf("could not parse If-Modified-Since: %v", err)
+		}
+		if !attr.Updated.Truncate(time.Second).After(last) {
+			w.WriteHeader(304)
+			return
+		}
+	}
 	objr, err := obj.NewReader(ctx)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
+	attrC := objr.Attrs.ContentEncoding
+	setTimeHeader(w, "Last-Modified", attr.Updated)
+	setStrHeader(w, "Content-Type", attr.ContentType)
+	setStrHeader(w, "Content-Language", attr.ContentLanguage)
+	setStrHeader(w, "Cache-Control", attr.CacheControl)
+	setStrHeader(w, "Content-Encoding", attrC)
+	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
+	setIntHeader(w, "Content-Length", attr.Size)
 	io.Copy(w, objr)
 }
 
