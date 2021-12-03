@@ -19,11 +19,11 @@ Added:
 This is a reverse proxy for Google Cloud Storage for performing limited disclosure (IP address restriction etc...). Gets the URL of the GCS object through its internal API. Therefore, it is possible to make GCS objects private and deliver limited content.
 
 ## Changes
-Difference from daichirata/gcsproxy is that is possible to put a static site in a private GCS bucket behind GLB with IAP.
+Difference from daichirata/gcsproxy is that it's possible to put a static site in a private GCS bucket behind GLB with IAP.
 
 New.
 - run in CloudRun
-- Pull SA key from secretMAnager
+- Pull SA key from secretManager
 - redirect 404 to index.html
 - set index page like index.html
 - use host name as a bucket name
@@ -58,33 +58,19 @@ User ==(https)> GlobalLB with IAP enabled ==(http)> CloudRun GCS-proxy ==(https)
 ```
 Usage of gcsproxy:
   -b string
-    	Bind address. (default "127.0.0.1:8080")
+     Bind address. (default "127.0.0.1:8080")
   -c string
-    	The path to the keyfile. If not present, client will use your default application credentials.
+     The path to the keyfile. If not present, client will use your default application credentials.
   -i string
      Index page file name.
   -dn Use hostname as a bucket name.
-  -r	Redirect to index.html if 404 not found.
+  -otel bool
+     Enable opentelemetry. (default false)
+  -r Redirect to index.html if 404 not found.
   -s string
-    	Use SA key from secretManager. E.G. 'projects/937121755211/secrets/gcs-proxy/versions/1'
-  -v	Show access log.
+     Use SA key from secretManager. E.G. 'projects/937121755211/secrets/gcs-proxy/versions/1'
+  -v Show access log.
 
-```
-
-**Dockerfile example**
-
-``` dockerfile
-FROM golang:1.16-alpine as build
-
-WORKDIR /app
-COPY . /app
-RUN go build -o dist/gcs-proxy_amd64_linux
-
-FROM alpine:3.13
-COPY --from=build /app/dist/gcs-proxy_amd64_linux /usr/local/bin/gcsproxy
-RUN chmod +x /usr/local/bin/gcsproxy
-
-CMD ["gcsproxy"]
 ```
 
 **systemd example**
