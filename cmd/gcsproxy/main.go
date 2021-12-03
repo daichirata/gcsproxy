@@ -6,22 +6,35 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/gorilla/mux"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+
+	"go.opentelemetry.io/otel/sdk/resource"
 )
 
 var (
 	bind          = flag.String("b", "127.0.0.1:8080", "Bind address.")
-	credentials   = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
+	creds         = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
 	redirect404   = flag.Bool("r", false, "Redirect to index.html if 404 not found.")
 	indexPage     = flag.String("i", "", "Index page file name.")
 	useDomainName = flag.Bool("dn", false, "Use hostname as a bucket name.")
 	useSecret     = flag.String("s", "", "Use SA key from secretManager. E.G. 'projects/937192795301/secrets/gcs-proxy/versions/1'")
 	verbose       = flag.Bool("v", false, "Show access log.")
+
+	enableOtel = flag.Bool("otel", false, "Enable opentelemetry.")
 )
 
 var (
@@ -29,7 +42,7 @@ var (
 	ctx    = context.Background()
 )
 
-func handleError(w http.ResponseWriter, err error) {
+func handleErrorRW(w http.ResponseWriter, err error) {
 	if err != nil {
 		if err == storage.ErrObjectNotExist {
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -37,6 +50,12 @@ func handleError(w http.ResponseWriter, err error) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 		return
+	}
+}
+
+func handleErrStr(err error, message string) {
+	if err != nil {
+		log.Fatalf("%s: %v", message, err)
 	}
 }
 
@@ -59,12 +78,6 @@ func setStrHeader(w http.ResponseWriter, key string, value string) {
 func setIntHeader(w http.ResponseWriter, key string, value int64) {
 	if value > 0 {
 		w.Header().Add(key, strconv.FormatInt(value, 10))
-	}
-}
-
-func setTimeHeader(w http.ResponseWriter, key string, value time.Time) {
-	if !value.IsZero() {
-		w.Header().Add(key, value.UTC().Format(http.TimeFormat))
 	}
 }
 
@@ -93,7 +106,7 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 		if *verbose {
 			log.Printf("[%s] %.3f %d %s %s",
 				addr,
-				time.Now().Sub(proc).Seconds(),
+				time.Since(proc).Seconds(),
 				writer.status,
 				r.Method,
 				r.URL,
@@ -135,7 +148,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		handleError(w, err)
+		handleErrorRW(w, err)
 		return
 	}
 
@@ -150,14 +163,58 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 
 	objr, err := obj.NewReader(ctx)
 	if err != nil {
-		handleError(w, err)
+		handleErrorRW(w, err)
 		return
 	}
 	_, err = io.Copy(w, objr)
 	if err != nil {
-		handleError(w, err)
+		handleErrorRW(w, err)
 		return
 	}
+}
+
+func initTracer() *sdktrace.TracerProvider {
+	ctx := context.Background()
+	var connType otlptracegrpc.Option
+
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "127.0.0.1:4317" // setting default endpoint for exporter
+	}
+
+	insecure := os.Getenv("OTEL_EXPORTER_OTLP_SECURE")
+	if insecure == "" || insecure == "false" {
+		connType = otlptracegrpc.WithInsecure()
+	} else {
+		connType = otlptracegrpc.WithTLSCredentials(credentials.NewClientTLSFromCert(nil, ""))
+	}
+
+	// Create and start new OTLP trace exporter
+	traceExporter, err := otlptracegrpc.New(ctx, connType, otlptracegrpc.WithEndpoint(endpoint), otlptracegrpc.WithDialOption(grpc.WithBlock()))
+	handleErrStr(err, "failed to create new OTLP trace exporter")
+
+	service := os.Getenv("GO_GORILLA_SERVICE_NAME")
+	if service == "" {
+		service = "gcs-proxy"
+	}
+
+	res := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		// the service name used to display traces in backends
+		semconv.ServiceNameKey.String(service),
+	)
+	handleErrStr(err, "failed to create resource")
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithResource(res),
+		sdktrace.WithBatcher(traceExporter),
+	)
+
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	return tp
 }
 
 func main() {
@@ -166,8 +223,8 @@ func main() {
 	var err error
 	var path string
 
-	if *credentials != "" {
-		client, err = storage.NewClient(ctx, option.WithCredentialsFile(*credentials))
+	if *creds != "" {
+		client, err = storage.NewClient(ctx, option.WithCredentialsFile(*creds))
 	} else if *useSecret != "" {
 		client, err = storage.NewClient(ctx, option.WithCredentialsFile(GetSecret(*useSecret)))
 	} else {
@@ -178,10 +235,20 @@ func main() {
 		log.Fatalf("Failed to create client: %v", err)
 	}
 
-	r := mux.NewRouter()
-
 	if !*useDomainName {
 		path = "/{bucket:[0-9a-zA-Z-_.]+}"
+	}
+
+	r := mux.NewRouter()
+
+	if *enableOtel {
+		tp := initTracer()
+		defer func() {
+			if err := tp.Shutdown(context.Background()); err != nil {
+				log.Printf("Error shutting down tracer provider: %v", err)
+			}
+		}()
+		r.Use(otelmux.Middleware("gcs-proxy"))
 	}
 
 	r.HandleFunc(path+"/{object:.*}", wrapper(proxy)).Methods("GET", "HEAD", "POST")
