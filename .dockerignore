@@ -1,0 +1,7 @@
+# Do not allow anything
+**
+
+# except these files
+!**/*.go
+!go.mod
+!go.sum
