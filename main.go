@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -100,7 +101,8 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 
 func proxy(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
-	obj := client.Bucket(params["bucket"]).Object(params["object"]).ReadCompressed(false)
+	gzipAcceptable := clientAcceptsGzip(r)
+	obj := client.Bucket(params["bucket"]).Object(params["object"]).ReadCompressed(gzipAcceptable)
 	attr, err := obj.Attrs(ctx)
 	if err != nil {
 		handleError(w, err)
@@ -128,8 +130,18 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	setStrHeader(w, "Cache-Control", attr.CacheControl)
 	setStrHeader(w, "Content-Encoding", attrC)
 	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
-	setIntHeader(w, "Content-Length", attr.Size)
+	if gzipAcceptable {
+		setIntHeader(w, "Content-Length", attr.Size)
+	}
 	io.Copy(w, objr)
+}
+
+func clientAcceptsGzip(r *http.Request) bool {
+	acceptHeader := r.Header.Get("Accept-Encoding")
+	if strings.Contains(acceptHeader, "gzip") {
+		return true
+	}
+	return false
 }
 
 func main() {
