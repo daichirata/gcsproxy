@@ -1,7 +1,14 @@
-FROM alpine:3.7
-ENV GCSPROXY_VERSION=0.3.0
-RUN apk add --update ca-certificates
-RUN apk add --no-cache --virtual .build-deps ca-certificates wget \
-  && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy_${GCSPROXY_VERSION}_amd64_linux -O /usr/local/bin/gcsproxy \
-  && chmod +x /usr/local/bin/gcsproxy \
-  && apk del .build-deps
+FROM debian:buster-slim AS build
+
+WORKDIR /tmp
+ENV GCSPROXY_VERSION=0.3.1
+
+RUN apt-get update \
+    && apt-get install --no-install-suggests --no-install-recommends --yes ca-certificates wget \
+    && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
+    && tar zxf gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
+    && cp ./gcsproxy-${GCSPROXY_VERSION}-linux-amd64/gcsproxy .
+
+FROM gcr.io/distroless/base
+COPY --from=build /tmp/gcsproxy /gcsproxy
+CMD ["/gcsproxy"]

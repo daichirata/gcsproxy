@@ -1,7 +1,9 @@
 # gcsproxy
+
 Reverse proxy for Google Cloud Storage.
 
 ## Description
+
 This is a reverse proxy for Google Cloud Storage for performing limited disclosure (IP address restriction etc...). Gets the URL of the GCS object through its internal API. Therefore, it is possible to make GCS objects private and deliver limited content.
 
 ```
@@ -20,7 +22,7 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 +------------+          +---------------+
 ```
 
-## Useage
+## Usage
 
 ```
 Usage of gcsproxy:
@@ -32,19 +34,32 @@ Usage of gcsproxy:
 
 ```
 
+The gcsproxy routing configuration is shown below.
+
+`"/{bucket:[0-9a-zA-Z-_.] +}/{object:. *}"`
+
+If you are running gcsproxy on localhost:8080 and you want to access the file `gs://test-bucket/your/file/path.txt` in GCS via gcsproxy,
+you can use the URL You can access the file via gcsproxy at the URL `http://localhost:8080/test-bucket/your/file/path.txt`.
+
+## Configurations
+
 **Dockerfile example**
 
 ``` dockerfile
-FROM alpine:3.7
+FROM debian:buster-slim AS build
 
-ENV GCSPROXY_VERSION=0.3.0
-RUN apk add --no-cache --virtual .build-deps ca-certificates wget \
-  && update-ca-certificates \
-  && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy_${GCSPROXY_VERSION}_amd64_linux -O /usr/local/bin/gcsproxy \
-  && chmod +x /usr/local/bin/gcsproxy \
-  && apk del .build-deps
+WORKDIR /tmp
+ENV GCSPROXY_VERSION=0.3.1
 
-CMD ["gcsproxy"]
+RUN apt-get update \
+    && apt-get install --no-install-suggests --no-install-recommends --yes ca-certificates wget \
+    && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
+    && tar zxf gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
+    && cp ./gcsproxy-${GCSPROXY_VERSION}-linux-amd64/gcsproxy .
+
+FROM gcr.io/distroless/base
+COPY --from=build /tmp/gcsproxy /gcsproxy
+CMD ["/gcsproxy"]
 ```
 
 **systemd example**
