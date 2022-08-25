@@ -1,26 +1,31 @@
 module github.com/daichirata/gcsproxy
 
-go 1.12
+go 1.18
 
 require (
-	cloud.google.com/go v0.34.0
-	github.com/golang/mock v1.2.0 // indirect
-	github.com/golang/protobuf v1.2.0
-	github.com/googleapis/gax-go v2.0.0+incompatible
-	github.com/gorilla/mux v1.6.2
-	github.com/hashicorp/golang-lru v0.5.1
-	go.opencensus.io v0.19.2
-	golang.org/x/exp v0.0.0-20190221220918-438050ddec5e // indirect
-	golang.org/x/lint v0.0.0-20190313153728-d0100b6bd8b3 // indirect
-	golang.org/x/net v0.0.0-20190328230028-74de082e2cca
-	golang.org/x/oauth2 v0.0.0-20190319182350-c85d3e98c914
-	golang.org/x/sys v0.0.0-20190329044733-9eb1bfa1ce65
-	golang.org/x/text v0.3.1-0.20180807135948-17ff2d5776d2
-	google.golang.org/api v0.3.0
-	google.golang.org/appengine v1.5.0
-	google.golang.org/genproto v0.0.0-20190327125643-d831d65fe17d
-	google.golang.org/grpc v1.19.0
-	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
-	gopkg.in/yaml.v2 v2.2.2 // indirect
-	honnef.co/go/tools v0.0.0-20190106161140-3f1c8253044a // indirect
+	cloud.google.com/go/storage v1.25.0
+	github.com/gorilla/mux v1.8.0
+	google.golang.org/api v0.94.0
+)
+
+require (
+	cloud.google.com/go v0.102.1 // indirect
+	cloud.google.com/go/compute v1.7.0 // indirect
+	cloud.google.com/go/iam v0.3.0 // indirect
+	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
+	github.com/golang/protobuf v1.5.2 // indirect
+	github.com/google/go-cmp v0.5.8 // indirect
+	github.com/google/uuid v1.3.0 // indirect
+	github.com/googleapis/enterprise-certificate-proxy v0.1.0 // indirect
+	github.com/googleapis/gax-go/v2 v2.4.0 // indirect
+	go.opencensus.io v0.23.0 // indirect
+	golang.org/x/net v0.0.0-20220624214902-1bab6f366d9e // indirect
+	golang.org/x/oauth2 v0.0.0-20220822191816-0ebed06d0094 // indirect
+	golang.org/x/sys v0.0.0-20220624220833-87e55d714810 // indirect
+	golang.org/x/text v0.3.7 // indirect
+	golang.org/x/xerrors v0.0.0-20220609144429-65e65417b02f // indirect
+	google.golang.org/appengine v1.6.7 // indirect
+	google.golang.org/genproto v0.0.0-20220720214146-176da50484ac // indirect
+	google.golang.org/grpc v1.48.0 // indirect
+	google.golang.org/protobuf v1.28.0 // indirect
 )

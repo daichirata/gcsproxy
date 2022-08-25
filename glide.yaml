@@ -1,4 +1,0 @@
-package: github.com/daichirata/gcsproxy
-import:
-- package: cloud.google.com/go
-- package: github.com/gorilla/mux
