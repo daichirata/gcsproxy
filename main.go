@@ -17,7 +17,7 @@ import (
 
 var (
 	bind        = flag.String("b", "127.0.0.1:8080", "Bind address")
-	verbose     = flag.Bool("v", false, "Show access log")
+	verbose     = flag.Bool("v", true, "Show access log")
 	credentials = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
 )
 
@@ -100,6 +100,7 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 }
 
 func proxy(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	params := mux.Vars(r)
 	gzipAcceptable := clientAcceptsGzip(r)
 	obj := client.Bucket(params["bucket"]).Object(params["object"]).ReadCompressed(gzipAcceptable)
@@ -123,6 +124,9 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+
+	defer objr.Close()
+
 	setTimeHeader(w, "Last-Modified", attr.Updated)
 	setStrHeader(w, "Content-Type", attr.ContentType)
 	setStrHeader(w, "Content-Language", attr.ContentLanguage)
@@ -130,7 +134,11 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
 	setIntHeader(w, "Content-Length", objr.Attrs.Size)
-	io.Copy(w, objr)
+
+	_, err = io.Copy(w, objr)
+	if err != nil {
+		log.Printf("error copying: %v", err)
+	}
 }
 
 func clientAcceptsGzip(r *http.Request) bool {
