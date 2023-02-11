@@ -99,6 +99,11 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 	}
 }
 
+func HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	setStrHeader(w, "Content-Type", "text/plain")
+	io.WriteString(w, "WORKING\n")
+}
+
 func proxy(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
 	gzipAcceptable := clientAcceptsGzip(r)
@@ -152,6 +157,7 @@ func main() {
 	}
 
 	r := mux.NewRouter()
+	r.HandleFunc("/healthcheck{_dummy:/?}", wrapper(HealthCheckHandler)).Methods("GET", "HEAD")
 	r.HandleFunc("/{bucket:[0-9a-zA-Z-_.]+}/{object:.*}", wrapper(proxy)).Methods("GET", "HEAD")
 
 	log.Printf("[service] listening on %s", *bind)
