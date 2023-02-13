@@ -157,7 +157,7 @@ func main() {
 	}
 
 	r := mux.NewRouter()
-	r.HandleFunc("/_health}", wrapper(HealthCheckHandler)).Methods("GET", "HEAD")
+	r.HandleFunc("/_health", wrapper(HealthCheckHandler)).Methods("GET", "HEAD")
 	r.HandleFunc("/{bucket:[0-9a-zA-Z-_.]+}/{object:.*}", wrapper(proxy)).Methods("GET", "HEAD")
 
 	log.Printf("[service] listening on %s", *bind)
