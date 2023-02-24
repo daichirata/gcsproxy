@@ -1,0 +1,12 @@
+---
+options:
+  logging: CLOUD_LOGGING_ONLY
+substitutions:
+  _SERVICE_NAME: gcsproxy
+images: ["europe-west3-docker.pkg.dev/$PROJECT_ID/docker-main/${_SERVICE_NAME}:${SHORT_SHA}-sha"]
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-image'
+    args: [ 'build', '-t', 'europe-west3-docker.pkg.dev/${PROJECT_ID}/docker-main/${_SERVICE_NAME}:${SHORT_SHA}-sha', '.' ]
+    waitFor: ['-']

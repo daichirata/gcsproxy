@@ -1,0 +1,39 @@
+---
+options:
+  logging: CLOUD_LOGGING_ONLY
+substitutions:
+  _SERVICE_NAME: gcsproxy
+images: ["europe-west3-docker.pkg.dev/$PROJECT_ID/docker-main/${_SERVICE_NAME}:${SHORT_SHA}-sha"]
+
+steps:
+
+- name: 'gcr.io/cloud-builders/docker'
+  id: 'build-image'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      docker build -t europe-west3-docker.pkg.dev/$PROJECT_ID/docker-main/${_SERVICE_NAME}:${SHORT_SHA}-sha .
+      docker push europe-west3-docker.pkg.dev/$PROJECT_ID/docker-main/${_SERVICE_NAME}:${SHORT_SHA}-sha
+  waitFor: ["-"]
+
+- name: 'eu.gcr.io/$PROJECT_ID/so1-cloudbuild-cicd:latest'
+  id: 'promote-image'
+  entrypoint: 'bash'
+  env:
+  - 'DOCKER_REPO=europe-west3-docker.pkg.dev/${PROJECT_ID}/docker-main'
+  - 'src_version=${SHORT_SHA}-sha'
+  - 'app_name=${_SERVICE_NAME}'
+  - 'app_images=app_name'
+  - 'target_version=${_TARGET_VERSION}'
+  args:
+    - '-c'
+    - |
+      cd /cicd && ./promote
+  secretEnv: ['GITHUB_TOKEN']
+  waitFor: ['build-image']
+
+availableSecrets:
+  secretManager:
+  - versionName: projects/$PROJECT_ID/secrets/github-token-rw/versions/latest
+    env: 'GITHUB_TOKEN'
