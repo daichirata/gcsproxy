@@ -54,7 +54,7 @@ func handleNotFound(w http.ResponseWriter, r *http.Request, object string, err e
 				fetchObject(w, r, params["bucket"], fmt.Sprintf("%s/%s", object, *defaultIndex))
 			}
 		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			handleError(w, err)
 		}
 		return
 	}
