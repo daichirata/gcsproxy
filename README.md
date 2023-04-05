@@ -6,7 +6,7 @@ Reverse proxy for Google Cloud Storage.
 
 This is a reverse proxy for Google Cloud Storage for performing limited disclosure (IP address restriction etc...). Gets the URL of the GCS object through its internal API. Therefore, it is possible to make GCS objects private and deliver limited content.
 
-```
+```bash
  +---------------------------------------+
  |                Nginx                  |
  |    access control (basic auth/ip)     |
@@ -24,13 +24,13 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 
 ## Usage
 
-```
+```bash
 Usage of gcsproxy:
   -b string
-    	Bind address (default "127.0.0.1:8080")
+      Bind address (default "127.0.0.1:8080")
   -c string
-    	The path to the keyfile. If not present, client will use your default application credentials.
-  -v	Show access log
+      The path to the keyfile. If not present, client will use your default application credentials.
+  -v  Show access log
 
 ```
 
@@ -43,7 +43,7 @@ you can use the URL You can access the file via gcsproxy at the URL `http://loca
 
 ## Configurations
 
-**Dockerfile example**
+### Dockerfile example
 
 ``` dockerfile
 FROM debian:buster-slim AS build
@@ -62,9 +62,9 @@ COPY --from=build /tmp/gcsproxy /gcsproxy
 CMD ["/gcsproxy"]
 ```
 
-**systemd example**
+### systemd example
 
-```
+```bash
 [Unit]
 Description=gcsproxy
 
@@ -77,9 +77,9 @@ ExecStop=/bin/kill -SIGTERM $MAINPID
 WantedBy = multi-user.target
 ```
 
-**nginx.conf**
+### nginx.conf
 
-```
+```bash
 upstream gcsproxy {
     server '127.0.0.1:8080';
 }
@@ -101,3 +101,5 @@ server {
     }
 }
 ```
+
+_Refer to <https://kubernetes.github.io/ingress-nginx/examples/rewrite/#rewrite-target> in ingress-nginx configurations._
