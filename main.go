@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -57,6 +58,50 @@ func handleNotFound(w http.ResponseWriter, r *http.Request, object string, err e
 		}
 		return
 	}
+}
+
+func fetchObject(w http.ResponseWriter, r *http.Request, bucket, object string) {
+	gzipAcceptable := clientAcceptsGzip(r)
+	obj := client.Bucket(bucket).Object(object).ReadCompressed(gzipAcceptable)
+	attr, err := obj.Attrs(ctx)
+	if err != nil {
+		if err == storage.ErrObjectNotExist {
+			if *verbose {
+				log.Printf("object does not exist %s", object)
+			}
+			if object == "404.html" {
+				http.Error(w, err.Error(), http.StatusNotFound)
+			} else {
+				handleNotFound(w, r, object, err)
+			}
+		} else {
+			handleError(w, err)
+		}
+		return
+	}
+	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
+		last, err := http.ParseTime(lastStrs[0])
+		if *verbose && err != nil {
+			log.Printf("could not parse If-Modified-Since: %v", err)
+		}
+		if !attr.Updated.Truncate(time.Second).After(last) {
+			w.WriteHeader(304)
+			return
+		}
+	}
+	objr, err := obj.NewReader(ctx)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	setTimeHeader(w, "Last-Modified", attr.Updated)
+	setStrHeader(w, "Content-Type", attr.ContentType)
+	setStrHeader(w, "Content-Language", attr.ContentLanguage)
+	setStrHeader(w, "Cache-Control", attr.CacheControl)
+	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
+	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
+	setIntHeader(w, "Content-Length", objr.Attrs.Size)
+	io.Copy(w, objr)
 }
 
 func header(r *http.Request, key string) (string, bool) {
@@ -137,47 +182,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(params["object"], "/") {
 		params["object"] += *defaultIndex
 	}
-	gzipAcceptable := clientAcceptsGzip(r)
-	obj := client.Bucket(params["bucket"]).Object(params["object"]).ReadCompressed(gzipAcceptable)
-	attr, err := obj.Attrs(ctx)
-	if err != nil {
-		if err == storage.ErrObjectNotExist {
-			if *verbose {
-				log.Printf("object does not exist %s", object)
-			}
-			if object == "404.html" {
-				http.Error(w, err.Error(), http.StatusNotFound)
-			} else {
-				handleNotFound(w, r, object, err)
-			}
-		} else {
-			handleError(w, err)
-		}
-		return
-	}
-	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
-		last, err := http.ParseTime(lastStrs[0])
-		if *verbose && err != nil {
-			log.Printf("could not parse If-Modified-Since: %v", err)
-		}
-		if !attr.Updated.Truncate(time.Second).After(last) {
-			w.WriteHeader(304)
-			return
-		}
-	}
-	objr, err := obj.NewReader(ctx)
-	if err != nil {
-		handleError(w, err)
-		return
-	}
-	setTimeHeader(w, "Last-Modified", attr.Updated)
-	setStrHeader(w, "Content-Type", attr.ContentType)
-	setStrHeader(w, "Content-Language", attr.ContentLanguage)
-	setStrHeader(w, "Cache-Control", attr.CacheControl)
-	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
-	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
-	setIntHeader(w, "Content-Length", objr.Attrs.Size)
-	io.Copy(w, objr)
+	fetchObject(w, r, params["bucket"], params["object"])
 }
 
 func clientAcceptsGzip(r *http.Request) bool {
