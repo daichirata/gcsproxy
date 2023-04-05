@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -19,6 +20,7 @@ var (
 	bind        = flag.String("b", "127.0.0.1:8080", "Bind address")
 	verbose     = flag.Bool("v", false, "Show access log")
 	credentials = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
+	defaultIndex = flag.String("i", "index.html", "The default index file to serve.")
 )
 
 var (
@@ -28,13 +30,78 @@ var (
 
 func handleError(w http.ResponseWriter, err error) {
 	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func handleNotFound(w http.ResponseWriter, r *http.Request, object string, err error) {
+	if err != nil {
 		if err == storage.ErrObjectNotExist {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			params := mux.Vars(r)
+			if *verbose {
+				log.Printf("object %s", object)
+			}
+			if strings.HasSuffix(object, *defaultIndex) {
+				if *verbose {
+					log.Printf("fetching 404")
+				}
+				fetchObject(w, r, params["bucket"], "404.html")
+			} else {
+				if *verbose {
+					log.Printf("fetching default index %s", fmt.Sprintf("%s/%s", object, *defaultIndex))
+				}
+				fetchObject(w, r, params["bucket"], fmt.Sprintf("%s/%s", object, *defaultIndex))
+			}
 		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			handleError(w, err)
 		}
 		return
 	}
+}
+
+func fetchObject(w http.ResponseWriter, r *http.Request, bucket, object string) {
+	gzipAcceptable := clientAcceptsGzip(r)
+	obj := client.Bucket(bucket).Object(object).ReadCompressed(gzipAcceptable)
+	attr, err := obj.Attrs(ctx)
+	if err != nil {
+		if err == storage.ErrObjectNotExist {
+			if *verbose {
+				log.Printf("object does not exist %s", object)
+			}
+			if object == "404.html" {
+				http.Error(w, err.Error(), http.StatusNotFound)
+			} else {
+				handleNotFound(w, r, object, err)
+			}
+		} else {
+			handleError(w, err)
+		}
+		return
+	}
+	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
+		last, err := http.ParseTime(lastStrs[0])
+		if *verbose && err != nil {
+			log.Printf("could not parse If-Modified-Since: %v", err)
+		}
+		if !attr.Updated.Truncate(time.Second).After(last) {
+			w.WriteHeader(304)
+			return
+		}
+	}
+	objr, err := obj.NewReader(ctx)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	setTimeHeader(w, "Last-Modified", attr.Updated)
+	setStrHeader(w, "Content-Type", attr.ContentType)
+	setStrHeader(w, "Content-Language", attr.ContentLanguage)
+	setStrHeader(w, "Cache-Control", attr.CacheControl)
+	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
+	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
+	setIntHeader(w, "Content-Length", objr.Attrs.Size)
+	io.Copy(w, objr)
 }
 
 func header(r *http.Request, key string) (string, bool) {
@@ -106,36 +173,16 @@ func HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
 
 func proxy(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
-	gzipAcceptable := clientAcceptsGzip(r)
-	obj := client.Bucket(params["bucket"]).Object(params["object"]).ReadCompressed(gzipAcceptable)
-	attr, err := obj.Attrs(ctx)
-	if err != nil {
-		handleError(w, err)
-		return
+	if *verbose {
+		log.Printf("proxying %s, object %s", params["bucket"], params["object"])
 	}
-	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
-		last, err := http.ParseTime(lastStrs[0])
-		if *verbose && err != nil {
-			log.Printf("could not parse If-Modified-Since: %v", err)
-		}
-		if !attr.Updated.Truncate(time.Second).After(last) {
-			w.WriteHeader(304)
-			return
-		}
+	if params["object"] == "" {
+		params["object"] = *defaultIndex
 	}
-	objr, err := obj.NewReader(ctx)
-	if err != nil {
-		handleError(w, err)
-		return
+	if strings.HasSuffix(params["object"], "/") {
+		params["object"] += *defaultIndex
 	}
-	setTimeHeader(w, "Last-Modified", attr.Updated)
-	setStrHeader(w, "Content-Type", attr.ContentType)
-	setStrHeader(w, "Content-Language", attr.ContentLanguage)
-	setStrHeader(w, "Cache-Control", attr.CacheControl)
-	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
-	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
-	setIntHeader(w, "Content-Length", objr.Attrs.Size)
-	io.Copy(w, objr)
+	fetchObject(w, r, params["bucket"], params["object"])
 }
 
 func clientAcceptsGzip(r *http.Request) bool {
