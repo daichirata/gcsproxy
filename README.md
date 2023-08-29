@@ -62,6 +62,55 @@ COPY --from=build /tmp/gcsproxy /gcsproxy
 CMD ["/gcsproxy"]
 ```
 
+### Docker image build example
+
+```bash
+docker build --build-arg GCSPROXY_VERSION=0.4.0 -t gcsproxy .
+```
+
+Example how to run the image
+
+The **d53ee11da87c.json** JSON files contains the Google Cloud Service Account credentials.
+
+```bash
+docker run \
+    -it --rm \
+    -p 8080:80 \
+    -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
+    -v $(pwd)/../d53ee11da87c.json:/cred.json gcsproxy 
+```
+
+### Docker Compose example
+
+```dockerfile
+version: '3.3'
+
+networks:
+  web:
+
+services:
+  gcsproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GCSPROXY_VERSION: 0.4.0
+        #HTTPS_PROXY: http://192.168.1.1:8080/
+        #HTTP_PROXY: http://192.168.1.1:8080/
+    restart: unless-stopped
+    networks:
+      - "web"
+    ports:
+      - 8080:80
+    command: -b 0.0.0.0:80 -c /cred.json
+    #environment:
+      #HTTPS_PROXY: http://192.168.1.1:8080/
+      #HTTP_PROXY: http://192.168.1.1:8080/
+    volumes:
+      - ./d53ee11da87c.json:/cred.json
+```
+
+
 **systemd example**
 
 ```
