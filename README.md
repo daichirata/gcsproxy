@@ -27,10 +27,12 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 ```
 Usage of gcsproxy:
   -b string
-    	Bind address (default "127.0.0.1:8080")
+        Bind address (default "127.0.0.1:8080")
   -c string
-    	The path to the keyfile. If not present, client will use your default application credentials.
-  -v	Show access log
+        The path to the keyfile. If not present, client will use your default application credentials.
+  -i string
+        The default index file to serve.
+  -v    Show access log
 
 ```
 
@@ -40,6 +42,15 @@ The gcsproxy routing configuration is shown below.
 
 If you are running gcsproxy on localhost:8080 and you want to access the file `gs://test-bucket/your/file/path.txt` in GCS via gcsproxy,
 you can use the URL You can access the file via gcsproxy at the URL `http://localhost:8080/test-bucket/your/file/path.txt`.
+
+If a default index file is specified and the target object does not exist, an attempt is made to retrieve the object specified in the default index file.
+
+```
+gcsproxy -i index.html
+
+http://localhost:8080/test-bucket/foo/bar
+#=> gs://test-bucket/foo/bar/index.html
+```
 
 ## Configurations
 
