@@ -24,10 +24,7 @@ var (
 	defaultIndex = flag.String("i", "", "The default index file to serve.")
 )
 
-var (
-	client *storage.Client
-	ctx    = context.Background()
-)
+var client *storage.Client
 
 func handleError(w http.ResponseWriter, err error) {
 	if errors.Is(err, storage.ErrObjectNotExist) {
@@ -99,7 +96,7 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 	}
 }
 
-func fetchObjectAttrs(bucket, object string) (*storage.ObjectAttrs, error) {
+func fetchObjectAttrs(ctx context.Context, bucket, object string) (*storage.ObjectAttrs, error) {
 	attrs, err := client.Bucket(bucket).Object(strings.TrimSuffix(object, "/")).Attrs(ctx)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
@@ -120,7 +117,7 @@ func fetchObjectAttrs(bucket, object string) (*storage.ObjectAttrs, error) {
 func proxy(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
 
-	attrs, err := fetchObjectAttrs(params["bucket"], params["object"])
+	attrs, err := fetchObjectAttrs(r.Context(), params["bucket"], params["object"])
 	if err != nil {
 		handleError(w, err)
 		return
@@ -137,7 +134,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
-	objr, err := client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(ctx)
+	objr, err := client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
 	if err != nil {
 		handleError(w, err)
 		return
@@ -162,9 +159,9 @@ func main() {
 
 	var err error
 	if *credentials != "" {
-		client, err = storage.NewClient(ctx, option.WithCredentialsFile(*credentials))
+		client, err = storage.NewClient(context.Background(), option.WithCredentialsFile(*credentials))
 	} else {
-		client, err = storage.NewClient(ctx)
+		client, err = storage.NewClient(context.Background())
 	}
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
