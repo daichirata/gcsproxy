@@ -2,11 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -17,10 +18,10 @@ import (
 )
 
 var (
-	bind        = flag.String("b", "127.0.0.1:8080", "Bind address")
-	verbose     = flag.Bool("v", false, "Show access log")
-	credentials = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
-	defaultIndex = flag.String("i", "index.html", "The default index file to serve.")
+	bind         = flag.String("b", "127.0.0.1:8080", "Bind address")
+	verbose      = flag.Bool("v", false, "Show access log")
+	credentials  = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
+	defaultIndex = flag.String("i", "", "The default index file to serve.")
 )
 
 var (
@@ -29,79 +30,11 @@ var (
 )
 
 func handleError(w http.ResponseWriter, err error) {
-	if err != nil {
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		http.Error(w, err.Error(), http.StatusNotFound)
+	} else {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
 	}
-}
-
-func handleNotFound(w http.ResponseWriter, r *http.Request, object string, err error) {
-	if err != nil {
-		if err == storage.ErrObjectNotExist {
-			params := mux.Vars(r)
-			if *verbose {
-				log.Printf("object %s", object)
-			}
-			if strings.HasSuffix(object, *defaultIndex) {
-				if *verbose {
-					log.Printf("fetching 404")
-				}
-				fetchObject(w, r, params["bucket"], "404.html")
-			} else {
-				if *verbose {
-					log.Printf("fetching default index %s", fmt.Sprintf("%s/%s", object, *defaultIndex))
-				}
-				fetchObject(w, r, params["bucket"], fmt.Sprintf("%s/%s", object, *defaultIndex))
-			}
-		} else {
-			handleError(w, err)
-		}
-		return
-	}
-}
-
-func fetchObject(w http.ResponseWriter, r *http.Request, bucket, object string) {
-	gzipAcceptable := clientAcceptsGzip(r)
-	obj := client.Bucket(bucket).Object(object).ReadCompressed(gzipAcceptable)
-	attr, err := obj.Attrs(ctx)
-	if err != nil {
-		if err == storage.ErrObjectNotExist {
-			if *verbose {
-				log.Printf("object does not exist %s", object)
-			}
-			if object == "404.html" {
-				http.Error(w, err.Error(), http.StatusNotFound)
-			} else {
-				handleNotFound(w, r, object, err)
-			}
-		} else {
-			handleError(w, err)
-		}
-		return
-	}
-	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
-		last, err := http.ParseTime(lastStrs[0])
-		if *verbose && err != nil {
-			log.Printf("could not parse If-Modified-Since: %v", err)
-		}
-		if !attr.Updated.Truncate(time.Second).After(last) {
-			w.WriteHeader(304)
-			return
-		}
-	}
-	objr, err := obj.NewReader(ctx)
-	if err != nil {
-		handleError(w, err)
-		return
-	}
-	setTimeHeader(w, "Last-Modified", attr.Updated)
-	setStrHeader(w, "Content-Type", attr.ContentType)
-	setStrHeader(w, "Content-Language", attr.ContentLanguage)
-	setStrHeader(w, "Cache-Control", attr.CacheControl)
-	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
-	setStrHeader(w, "Content-Disposition", attr.ContentDisposition)
-	setIntHeader(w, "Content-Length", objr.Attrs.Size)
-	io.Copy(w, objr)
 }
 
 func header(r *http.Request, key string) (string, bool) {
@@ -166,28 +99,62 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 	}
 }
 
-func HealthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	setStrHeader(w, "Content-Type", "text/plain")
-	io.WriteString(w, "OK\n")
+func fetchObjectAttrs(bucket, object string) (*storage.ObjectAttrs, error) {
+	attrs, err := client.Bucket(bucket).Object(strings.TrimSuffix(object, "/")).Attrs(ctx)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			if *defaultIndex == "" {
+				return nil, err
+			}
+			object, err := url.JoinPath(object, *defaultIndex)
+			if err != nil {
+				return nil, err
+			}
+			return client.Bucket(bucket).Object(object).Attrs(ctx)
+		}
+		return nil, err
+	}
+	return attrs, nil
 }
 
 func proxy(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
-	if *verbose {
-		log.Printf("proxying %s, object %s", params["bucket"], params["object"])
+
+	attrs, err := fetchObjectAttrs(params["bucket"], params["object"])
+	if err != nil {
+		handleError(w, err)
+		return
 	}
-	if params["object"] == "" {
-		params["object"] = *defaultIndex
+	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
+		last, err := http.ParseTime(lastStrs[0])
+		if *verbose && err != nil {
+			log.Printf("could not parse If-Modified-Since: %v", err)
+		}
+		if !attrs.Updated.Truncate(time.Second).After(last) {
+			w.WriteHeader(304)
+			return
+		}
 	}
-	if strings.HasSuffix(params["object"], "/") {
-		params["object"] += *defaultIndex
+
+	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+	objr, err := client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(ctx)
+	if err != nil {
+		handleError(w, err)
+		return
 	}
-	fetchObject(w, r, params["bucket"], params["object"])
+	setTimeHeader(w, "Last-Modified", attrs.Updated)
+	setStrHeader(w, "Content-Type", attrs.ContentType)
+	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
+	setStrHeader(w, "Cache-Control", attrs.CacheControl)
+	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
+	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
+	setIntHeader(w, "Content-Length", objr.Attrs.Size)
+	io.Copy(w, objr)
 }
 
-func clientAcceptsGzip(r *http.Request) bool {
-	acceptHeader := r.Header.Get("Accept-Encoding")
-	return strings.Contains(acceptHeader, "gzip")
+func healthCheck(w http.ResponseWriter, r *http.Request) {
+	setStrHeader(w, "Content-Type", "text/plain")
+	io.WriteString(w, "OK\n")
 }
 
 func main() {
@@ -204,7 +171,7 @@ func main() {
 	}
 
 	r := mux.NewRouter()
-	r.HandleFunc("/_health", wrapper(HealthCheckHandler)).Methods("GET", "HEAD")
+	r.HandleFunc("/_health", wrapper(healthCheck)).Methods("GET", "HEAD")
 	r.HandleFunc("/{bucket:[0-9a-zA-Z-_.]+}/{object:.*}", wrapper(proxy)).Methods("GET", "HEAD")
 
 	log.Printf("[service] listening on %s", *bind)
