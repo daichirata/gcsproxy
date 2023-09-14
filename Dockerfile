@@ -1,7 +1,7 @@
 FROM debian:buster-slim AS build
 
 WORKDIR /tmp
-ENV GCSPROXY_VERSION=0.3.1
+ARG GCSPROXY_VERSION=0.3.1
 
 RUN apt-get update \
     && apt-get install --no-install-suggests --no-install-recommends --yes ca-certificates wget \
@@ -11,4 +11,5 @@ RUN apt-get update \
 
 FROM gcr.io/distroless/base
 COPY --from=build /tmp/gcsproxy /gcsproxy
-CMD ["/gcsproxy"]
+ENTRYPOINT ["/gcsproxy"]
+CMD [ "-b", "0.0.0.0:80" ]
