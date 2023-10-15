@@ -104,10 +104,20 @@ func fetchObjectAttrs(ctx context.Context, bucket, object string) (*storage.Obje
 				return nil, err
 			}
 			object, err := url.JoinPath(object, *defaultIndex)
+			if strings.HasSuffix(object, *defaultIndex) && strings.Count(object, "/") == 1 {
+				object, err = url.JoinPath(object, "404.html")
+			}
+			if strings.HasSuffix(object, *defaultIndex) && strings.Count(object, "/") > 1 {
+				// Try fetching the default index one directory higher.
+				parts := strings.Split(object, "/")
+				parts = parts[:len(parts)-2] // "/$FOLDER/index.html" removed.
+				newObject := strings.Join(parts, "/")
+				object, err = url.JoinPath(newObject, *defaultIndex)
+			}
 			if err != nil {
 				return nil, err
 			}
-			return client.Bucket(bucket).Object(object).Attrs(ctx)
+			return fetchObjectAttrs(ctx, bucket, object)
 		}
 		return nil, err
 	}
