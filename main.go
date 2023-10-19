@@ -133,18 +133,27 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
-	objr, err := client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
-	if err != nil {
-		handleError(w, err)
-		return
-	}
 	setTimeHeader(w, "Last-Modified", attrs.Updated)
 	setStrHeader(w, "Content-Type", attrs.ContentType)
 	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
 	setStrHeader(w, "Cache-Control", attrs.CacheControl)
-	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
+
+	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+
+	var objr *storage.Reader
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		objH := client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable)
+		serveRange(w, r, attrs.Updated, attrs.Size, objH)
+		return
+	} else {
+		objr, err = client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
+	}
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 	setIntHeader(w, "Content-Length", objr.Attrs.Size)
 	io.Copy(w, objr)
 }
