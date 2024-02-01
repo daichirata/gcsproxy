@@ -1,15 +1,25 @@
-FROM debian:buster-slim AS build
+FROM golang:1.21 as builder
 
-WORKDIR /tmp
-ARG GCSPROXY_VERSION=0.3.1
+WORKDIR /workspace
+# Copy the Go Modules manifests
+COPY go.mod go.mod
+COPY go.sum go.sum
+# cache deps before building and copying source so that we don't need to re-download as much
+# and so that source changes don't invalidate our downloaded layer
+RUN go mod download
 
-RUN apt-get update \
-    && apt-get install --no-install-suggests --no-install-recommends --yes ca-certificates wget \
-    && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
-    && tar zxf gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
-    && cp ./gcsproxy-${GCSPROXY_VERSION}-linux-amd64/gcsproxy .
+# Copy the go source
+COPY main.go main.go
 
-FROM gcr.io/distroless/base
-COPY --from=build /tmp/gcsproxy /gcsproxy
+# Build
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GO111MODULE=on go build -a -o gcsproxy main.go
+
+# Use from scratch
+# Use distroless as minimal base image to package the gcsproxy binary
+# Refer to https://github.com/GoogleContainerTools/distroless for more details
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /workspace/gcsproxy /
+USER nonroot:nonroot
 ENTRYPOINT ["/gcsproxy"]
 CMD [ "-b", "0.0.0.0:80" ]

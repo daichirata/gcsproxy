@@ -4,7 +4,7 @@ GOFILES := $(shell find . -type f -name '*.go')
 build: bin/$(BIN_NAME)
 
 bin/$(BIN_NAME): $(GOFILES)
-	go build -o $@ .
+	CGO_ENABLED=0 go build -o $@ .
 
 build-cross: clean
 	GOOS=linux  GOARCH=amd64 go build -o dist/$(BIN_NAME)_amd64_linux
@@ -16,7 +16,7 @@ clean:
 	rm -rf bin dist
 
 deps:
-	go get -t ./...
+	go get .
 	go mod tidy
 
 test:
