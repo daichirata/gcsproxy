@@ -15,8 +15,11 @@ COPY main.go main.go
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GO111MODULE=on go build -a -o gcsproxy main.go
 
 # Use from scratch
-FROM scratch
+# Use distroless as minimal base image to package the gcsproxy binary
+# Refer to https://github.com/GoogleContainerTools/distroless for more details
+FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/gcsproxy /
+USER nonroot:nonroot
 ENTRYPOINT ["/gcsproxy"]
 CMD [ "-b", "0.0.0.0:80" ]
