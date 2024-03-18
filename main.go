@@ -97,13 +97,23 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 }
 
 func fetchObjectAttrs(ctx context.Context, bucket, object string) (*storage.ObjectAttrs, error) {
+	var err error
+	var indexAppended bool
+	if object == "" && *defaultIndex != "" {
+		object, err = url.JoinPath(object, *defaultIndex)
+		if err != nil {
+			return nil, err
+		}
+		indexAppended = true
+	}
+
 	attrs, err := client.Bucket(bucket).Object(strings.TrimSuffix(object, "/")).Attrs(ctx)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
-			if *defaultIndex == "" {
+			if *defaultIndex == "" || indexAppended {
 				return nil, err
 			}
-			object, err := url.JoinPath(object, *defaultIndex)
+			object, err = url.JoinPath(object, *defaultIndex)
 			if err != nil {
 				return nil, err
 			}
