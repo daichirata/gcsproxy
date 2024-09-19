@@ -1,7 +1,7 @@
 FROM debian:buster-slim AS build
 
 WORKDIR /tmp
-ARG GCSPROXY_VERSION=0.3.1
+ARG GCSPROXY_VERSION=0.4.2
 
 RUN apt-get update \
     && apt-get install --no-install-suggests --no-install-recommends --yes ca-certificates wget \
