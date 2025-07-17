@@ -22,6 +22,10 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 +------------+          +---------------+
 ```
 
+## Download
+
+Download the latest version of gcsproxy from the [Github Releases page](https://github.com/daichirata/gcsproxy/releases).
+
 ## Usage
 
 ```
@@ -88,7 +92,7 @@ docker run \
     -it --rm \
     -p 8080:80 \
     -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
-    -v $(pwd)/../d53ee11da87c.json:/cred.json gcsproxy 
+    -v $(pwd)/../d53ee11da87c.json:/cred.json gcsproxy
 ```
 
 ### Docker Compose example
