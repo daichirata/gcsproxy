@@ -80,6 +80,13 @@ func serveRange(w http.ResponseWriter, r *http.Request, modtime time.Time, size 
 		ranges = nil
 	}
 	switch {
+	case len(ranges) == 0:
+		// If-Range check failed or range was otherwise cleared.
+		// Serve the full content so the client can update its cache.
+		if sendContent, err = objH.NewRangeReader(context.Background(), 0, -1); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	case len(ranges) == 1:
 		// RFC 7233, Section 4.1:
 		// "If a single part is being transferred, the server
