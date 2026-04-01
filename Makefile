@@ -9,8 +9,8 @@ bin/$(BIN_NAME): $(GOFILES)
 build-cross: clean
 	GOOS=linux  GOARCH=amd64 go build -o dist/$(BIN_NAME)_amd64_linux
 	GOOS=darwin GOARCH=amd64 go build -o dist/$(BIN_NAME)_amd64_darwin
-	GOOS=linux  GOARCH=arm go build -o dist/$(BIN_NAME)_arm_linux
-	GOOS=darwin GOARCH=arm go build -o dist/$(BIN_NAME)_arm_darwin
+	GOOS=linux  GOARCH=arm64 go build -o dist/$(BIN_NAME)_arm64_linux
+	GOOS=darwin GOARCH=arm64 go build -o dist/$(BIN_NAME)_arm64_darwin
 
 clean:
 	rm -rf bin dist

@@ -28,9 +28,11 @@ var client *storage.Client
 
 func handleError(w http.ResponseWriter, err error) {
 	if errors.Is(err, storage.ErrObjectNotExist) {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		log.Printf("object not found: %v", err)
+		http.Error(w, "not found", http.StatusNotFound)
 	} else {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("internal error: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 	}
 }
 
@@ -72,6 +74,8 @@ func (w *wrapResponseWriter) WriteHeader(status int) {
 	w.status = status
 }
 
+var logSanitizer = strings.NewReplacer("\n", "", "\r", "")
+
 func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		proc := time.Now()
@@ -82,7 +86,7 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 		fn(writer, r)
 		addr := r.RemoteAddr
 		if ip, found := header(r, "X-Forwarded-For"); found {
-			addr = ip
+			addr = logSanitizer.Replace(ip)
 		}
 		if *verbose {
 			log.Printf("[%s] %.3f %d %s %s",
@@ -90,10 +94,19 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 				time.Now().Sub(proc).Seconds(),
 				writer.status,
 				r.Method,
-				r.URL,
+				logSanitizer.Replace(r.URL.String()),
 			)
 		}
 	}
+}
+
+func hasDotDotSegment(s string) bool {
+	for _, seg := range strings.Split(s, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func fetchObjectAttrs(ctx context.Context, bucket, object string) (*storage.ObjectAttrs, error) {
@@ -127,7 +140,13 @@ func fetchObjectAttrs(ctx context.Context, bucket, object string) (*storage.Obje
 func proxy(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
 
-	attrs, err := fetchObjectAttrs(r.Context(), params["bucket"], params["object"])
+	object := params["object"]
+	if hasDotDotSegment(object) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	attrs, err := fetchObjectAttrs(r.Context(), params["bucket"], object)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -143,25 +162,36 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	setTimeHeader(w, "Last-Modified", attrs.Updated)
+	setStrHeader(w, "Content-Type", attrs.ContentType)
+	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
+	setStrHeader(w, "Cache-Control", attrs.CacheControl)
+	setStrHeader(w, "Content-Encoding", attrs.ContentEncoding)
+	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
+	setIntHeader(w, "Content-Length", attrs.Size)
+
+	if r.Method == http.MethodHead {
+		return
+	}
+
 	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
 	objr, err := client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
 	if err != nil {
 		handleError(w, err)
 		return
 	}
-	setTimeHeader(w, "Last-Modified", attrs.Updated)
-	setStrHeader(w, "Content-Type", attrs.ContentType)
-	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
-	setStrHeader(w, "Cache-Control", attrs.CacheControl)
-	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
-	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
-	setIntHeader(w, "Content-Length", objr.Attrs.Size)
-	io.Copy(w, objr)
+	_, err = io.Copy(w, objr)
+	if err != nil {
+		return
+	}
 }
 
-func healthCheck(w http.ResponseWriter, r *http.Request) {
+func healthCheck(w http.ResponseWriter, _ *http.Request) {
 	setStrHeader(w, "Content-Type", "text/plain")
-	io.WriteString(w, "OK\n")
+	_, err := io.WriteString(w, "OK\n")
+	if err != nil {
+		return
+	}
 }
 
 func main() {
@@ -169,6 +199,7 @@ func main() {
 
 	var err error
 	if *credentials != "" {
+		//goland:noinspection GoDeprecation
 		client, err = storage.NewClient(context.Background(), option.WithCredentialsFile(*credentials))
 	} else {
 		client, err = storage.NewClient(context.Background())
