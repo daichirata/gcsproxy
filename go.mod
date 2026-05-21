@@ -3,6 +3,7 @@ module github.com/daichirata/gcsproxy
 go 1.25.0
 
 require (
+	cloud.google.com/go/auth v0.20.0
 	cloud.google.com/go/storage v1.62.1
 	github.com/fsouza/fake-gcs-server v1.54.0
 	github.com/gorilla/mux v1.8.1
@@ -12,7 +13,6 @@ require (
 require (
 	cel.dev/expr v0.25.1 // indirect
 	cloud.google.com/go v0.123.0 // indirect
-	cloud.google.com/go/auth v0.20.0 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	cloud.google.com/go/iam v1.7.0 // indirect

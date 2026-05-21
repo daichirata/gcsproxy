@@ -12,16 +12,18 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/storage"
 	"github.com/gorilla/mux"
 	"google.golang.org/api/option"
 )
 
 var (
-	bind         = flag.String("b", "127.0.0.1:8080", "Bind address")
-	verbose      = flag.Bool("v", false, "Show access log")
-	credentials  = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
-	defaultIndex = flag.String("i", "", "The default index file to serve.")
+	bind            = flag.String("b", "127.0.0.1:8080", "Bind address")
+	verbose         = flag.Bool("v", false, "Show access log")
+	credentialsFile = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
+	defaultIndex    = flag.String("i", "", "The default index file to serve.")
+	sourceBucket    = flag.String("bucket", "", "Fixed bucket name. If unset, the bucket is taken from the first path segment.")
 )
 
 var client *storage.Client
@@ -124,10 +126,8 @@ func fetchObjectAttrs(ctx context.Context, bucket, object string) (*storage.Obje
 	return attrs, nil
 }
 
-func proxy(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-
-	attrs, err := fetchObjectAttrs(r.Context(), params["bucket"], params["object"])
+func proxy(w http.ResponseWriter, r *http.Request, bucket, object string) {
+	attrs, err := fetchObjectAttrs(r.Context(), bucket, object)
 	if err != nil {
 		handleError(w, err)
 		return
@@ -164,25 +164,46 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "OK\n")
 }
 
+func newRouter(sourceBucket string) http.Handler {
+	r := mux.NewRouter()
+	r.HandleFunc("/_health", wrapper(healthCheck)).Methods("GET", "HEAD")
+
+	if sourceBucket != "" {
+		r.HandleFunc("/{object:.*}", wrapper(func(w http.ResponseWriter, r *http.Request) {
+			proxy(w, r, sourceBucket, mux.Vars(r)["object"])
+		})).Methods("GET", "HEAD")
+	} else {
+		r.HandleFunc("/{bucket:[0-9a-zA-Z-_.]+}/{object:.*}", wrapper(func(w http.ResponseWriter, r *http.Request) {
+			params := mux.Vars(r)
+			proxy(w, r, params["bucket"], params["object"])
+		})).Methods("GET", "HEAD")
+	}
+	return r
+}
+
 func main() {
 	flag.Parse()
 
-	var err error
-	if *credentials != "" {
-		client, err = storage.NewClient(context.Background(), option.WithCredentialsFile(*credentials))
-	} else {
-		client, err = storage.NewClient(context.Background())
+	ctx := context.Background()
+	var opts []option.ClientOption
+	if *credentialsFile != "" {
+		creds, err := credentials.DetectDefault(&credentials.DetectOptions{
+			CredentialsFile: *credentialsFile,
+			Scopes:          []string{storage.ScopeFullControl},
+		})
+		if err != nil {
+			log.Fatalf("Failed to load credentials: %v", err)
+		}
+		opts = append(opts, option.WithAuthCredentials(creds))
 	}
+	var err error
+	client, err = storage.NewClient(ctx, opts...)
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
 
-	r := mux.NewRouter()
-	r.HandleFunc("/_health", wrapper(healthCheck)).Methods("GET", "HEAD")
-	r.HandleFunc("/{bucket:[0-9a-zA-Z-_.]+}/{object:.*}", wrapper(proxy)).Methods("GET", "HEAD")
-
 	log.Printf("[service] listening on %s", *bind)
-	if err := http.ListenAndServe(*bind, r); err != nil {
+	if err := http.ListenAndServe(*bind, newRouter(*sourceBucket)); err != nil {
 		log.Fatal(err)
 	}
 }
