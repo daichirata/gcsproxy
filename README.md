@@ -89,6 +89,8 @@ Usage of gcsproxy:
         Default index file to serve.
   -log-format string
         Log output format: text or json. (default "json")
+  -log-level string
+        Minimum log level: debug, info, warn, or error. (default "info")
   -not-found string
         Object served with HTTP 404 for unmatched routes.
   -spa
@@ -164,6 +166,12 @@ gcsproxy -log-format text -v
 ```
 
 The access log line is only emitted when `-v` is set.
+
+`-log-level <debug|info|warn|error>` (default `info`) filters at the slog handler. Set it to `warn` to suppress the `INFO` startup and access logs while keeping `WARN`/`ERROR` visible:
+
+```
+gcsproxy -log-level warn
+```
 
 ### Transfer encoding
 

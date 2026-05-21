@@ -1104,3 +1104,71 @@ func TestProxy_Range_ForwardsContentEncoding(t *testing.T) {
 		t.Errorf("Content-Encoding = %q, want %q", got, "br")
 	}
 }
+
+// --- Log level tests ---
+
+func TestParseLogLevel(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    slog.Level
+		wantErr bool
+	}{
+		{"debug", slog.LevelDebug, false},
+		{"info", slog.LevelInfo, false},
+		{"warn", slog.LevelWarn, false},
+		{"error", slog.LevelError, false},
+		{"DEBUG", slog.LevelDebug, false}, // case-insensitive
+		{"Info", slog.LevelInfo, false},
+		{"WARN", slog.LevelWarn, false},
+		{"", 0, true},
+		{"trace", 0, true},
+		{"notice", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := parseLogLevel(tc.in)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if err == nil && got != tc.want {
+				t.Errorf("level = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAccessLog_SuppressedByLogLevel(t *testing.T) {
+	// Even with -v on, an access log at INFO is filtered out when the
+	// handler level is WARN.
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+	s.verbose = true
+
+	var buf bytes.Buffer
+	installLogger(t, slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := strings.TrimSpace(buf.String()); got != "" {
+		t.Errorf("INFO access log should be filtered at WARN, got %q", got)
+	}
+}
+
+func TestWarnLog_PassesThroughWarnLevel(t *testing.T) {
+	// A slog.Warn call should still appear when the handler level is WARN.
+	var buf bytes.Buffer
+	installLogger(t, slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	slog.Warn("smoke", "key", "value")
+
+	if got := buf.String(); !strings.Contains(got, `"level":"WARN"`) || !strings.Contains(got, `"msg":"smoke"`) {
+		t.Errorf("warn log was not emitted at WARN level, got %q", got)
+	}
+}
