@@ -39,6 +39,7 @@ curl http://localhost:8080/<your-bucket>/<your-object>
 - Streams GCS objects directly to clients (no temporary files on disk)
 - Forwards `Content-Type`, `Content-Language`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Last-Modified` (and `Content-Length` with `-content-length`)
 - Honors `If-Modified-Since` and replies `304 Not Modified` when appropriate
+- Supports `Range` requests (single range) for partial downloads / video seeking, forwarded to GCS so only the requested bytes traverse the wire
 - Negotiates `Content-Encoding: gzip` when the client accepts it
 - Optional default index file (`-i`) for serving static sites
 - Optional fixed bucket (`-bucket`) for hosting a single bucket without exposing its name in URLs
@@ -166,9 +167,11 @@ The access log line is only emitted when `-v` is set.
 
 ### Transfer encoding
 
-By default gcsproxy does not emit the `Content-Length` header. `net/http` then uses `Transfer-Encoding: chunked` for any response large enough to matter — which is what platforms like Cloud Run need to bypass their [32 MiB non-streamed response cap](https://cloud.google.com/run/quotas). Small responses may still get an auto-populated `Content-Length` from `net/http`, but that is harmless because they are well below any platform limit.
+By default gcsproxy does not emit the `Content-Length` header. `net/http` then uses `Transfer-Encoding: chunked` for any response large enough to matter, which bypasses the [32 MiB non-streamed response cap](https://cloud.google.com/run/quotas) enforced by platforms like Cloud Run.
 
-Pass `-content-length` to opt back into emitting the header for every response, e.g. when clients need to know the total size up front for progress indicators. With this flag, the 32 MiB Cloud Run cap will apply.
+Small responses may still get an auto-populated `Content-Length` from `net/http`, but that is harmless because they are well below any platform limit.
+
+Pass `-content-length` to emit the header for every response — useful when clients need to know the total size up front for progress indicators. The 32 MiB Cloud Run cap will then apply.
 
 ### CORS
 
@@ -179,7 +182,33 @@ gcsproxy -cors-origin '*'
 gcsproxy -cors-origin 'https://example.com'
 ```
 
-This is sufficient for [simple cross-origin requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS#simple_requests) — `<img>`, `<link>`, `<video>`, plain `fetch(url)` etc. — which is what most static-site hosting needs. Requests that require a preflight (custom headers, credentialed `fetch`, non-`GET/HEAD/POST` methods) are not supported; front gcsproxy with a proxy like nginx if you need that.
+This is sufficient for [simple cross-origin requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS#simple_requests) — `<img>`, `<link>`, `<video>`, plain `fetch(url)`, etc. — which is what most static-site hosting needs.
+
+Requests that require a preflight (custom headers, credentialed `fetch`, non-`GET/HEAD/POST` methods) are not supported; front gcsproxy with a proxy like nginx if you need that.
+
+### Range requests
+
+gcsproxy advertises `Accept-Ranges: bytes` on full responses (except for `Content-Encoding: gzip` objects, see below) and serves a single byte range when the client sends a `Range` header:
+
+```
+GET /test-bucket/video.mp4
+Range: bytes=1048576-2097151
+
+→ 206 Partial Content
+   Content-Range: bytes 1048576-2097151/<total>
+   Content-Length: 1048576
+```
+
+The range is forwarded to GCS via [`NewRangeReader`](https://pkg.go.dev/cloud.google.com/go/storage#ObjectHandle.NewRangeReader), so only the requested bytes are transferred from GCS — useful for video seeking, resumable downloads, and large-file streaming.
+
+Supported forms: `bytes=N-M`, `bytes=N-`, and `bytes=-N`. Multi-range requests (`bytes=0-99,200-299`) are reduced to their first range; `multipart/byteranges` responses are not implemented.
+
+Edge cases:
+
+- Range headers with a non-`bytes` unit are ignored and the request is served as a normal `200`, per [RFC 9110 §14.2](https://httpwg.org/specs/rfc9110.html#field.range). The same ignore-and-fall-through applies to byte-ranges that fail to parse as integers.
+- Byte-ranges that fall outside the object — or whose last byte precedes the first (e.g. `bytes=500-100`) — return `416` with a `Content-Range: bytes */<size>` header.
+- `If-Range` is not honored — the range is always served when an in-bounds `Range` header is present.
+- Objects stored with `Content-Encoding: gzip` cannot be served as partial content (GCS transcodes them and offsets become ambiguous), so the handler falls back to a full `200` body.
 
 ### Health check
 

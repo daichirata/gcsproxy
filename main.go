@@ -177,6 +177,11 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, bucket, object st
 		}
 	}
 
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		s.streamRange(w, r, attrs, rangeHeader)
+		return
+	}
+
 	if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
 		handleError(w, err)
 	}
@@ -224,18 +229,138 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 	if err != nil {
 		return err
 	}
+	defer objr.Close()
+
 	setTimeHeader(w, "Last-Modified", attrs.Updated)
 	setStrHeader(w, "Content-Type", attrs.ContentType)
 	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
 	setStrHeader(w, "Cache-Control", attrs.CacheControl)
-	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
+	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
+
+	if !strings.EqualFold(attrs.ContentEncoding, "gzip") {
+		setStrHeader(w, "Accept-Ranges", "bytes")
+	}
 	if s.contentLength {
 		setIntHeader(w, "Content-Length", objr.Attrs.Size)
 	}
+
 	w.WriteHeader(status)
 	io.Copy(w, objr)
 	return nil
+}
+
+func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs, rangeHeader string) {
+	// GCS transcodes objects stored with Content-Encoding: gzip on download,
+	// which makes Range offsets ambiguous and effectively ignored (verified
+	// empirically). Fall back to a full 200 response in that case so the
+	// client gets a coherent body it can decode and seek itself. Other
+	// encodings (br, deflate, etc.) are not transcoded and Range works
+	// normally over the stored bytes.
+	if strings.EqualFold(attrs.ContentEncoding, "gzip") {
+		if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
+			handleError(w, err)
+		}
+		return
+	}
+
+	start, length, err := parseSingleRange(rangeHeader, attrs.Size)
+	if err != nil {
+		switch {
+		case errors.Is(err, errRangeIgnore):
+			// Non-"bytes" range units MUST be ignored per RFC 9110 §14.2;
+			// we extend the same treatment to byte-ranges that fail to
+			// parse as integers, so a single malformed header (Range:
+			// items=0-10, Range: bytes=abc-def) does not downgrade a
+			// previously-working download into 416.
+			if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
+				handleError(w, err)
+			}
+			return
+		case errors.Is(err, errRangeUnsatisfiable):
+			setStrHeader(w, "Content-Range", fmt.Sprintf("bytes */%d", attrs.Size))
+			http.Error(w, "Requested Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+	}
+
+	objr, err := s.client.Bucket(attrs.Bucket).Object(attrs.Name).NewRangeReader(r.Context(), start, length)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+	defer objr.Close()
+
+	setTimeHeader(w, "Last-Modified", attrs.Updated)
+	setStrHeader(w, "Content-Type", attrs.ContentType)
+	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
+	setStrHeader(w, "Cache-Control", attrs.CacheControl)
+	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
+	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
+	setStrHeader(w, "Accept-Ranges", "bytes")
+	setStrHeader(w, "Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, attrs.Size))
+
+	if s.contentLength {
+		setIntHeader(w, "Content-Length", length)
+	}
+
+	w.WriteHeader(http.StatusPartialContent)
+	io.Copy(w, objr)
+}
+
+var (
+	errRangeIgnore        = errors.New("range header ignored")
+	errRangeUnsatisfiable = errors.New("range not satisfiable")
+)
+
+func parseSingleRange(header string, size int64) (start, length int64, err error) {
+	const prefix = "bytes="
+	if !strings.HasPrefix(header, prefix) {
+		return 0, 0, errRangeIgnore
+	}
+	spec := strings.TrimSpace(strings.SplitN(strings.TrimPrefix(header, prefix), ",", 2)[0])
+	dash := strings.IndexByte(spec, '-')
+	if dash < 0 {
+		return 0, 0, errRangeIgnore
+	}
+	startStr, endStr := spec[:dash], spec[dash+1:]
+
+	if startStr == "" {
+		// Suffix range: -N → last N bytes.
+		n, perr := strconv.ParseInt(endStr, 10, 64)
+		if perr != nil || n <= 0 {
+			return 0, 0, errRangeIgnore
+		}
+		if n > size {
+			n = size
+		}
+		if n == 0 {
+			return 0, 0, errRangeUnsatisfiable
+		}
+		return size - n, n, nil
+	}
+
+	s, perr := strconv.ParseInt(startStr, 10, 64)
+	if perr != nil || s < 0 {
+		return 0, 0, errRangeIgnore
+	}
+	if s >= size {
+		return 0, 0, errRangeUnsatisfiable
+	}
+	if endStr == "" {
+		return s, size - s, nil
+	}
+	e, perr := strconv.ParseInt(endStr, 10, 64)
+	if perr != nil {
+		return 0, 0, errRangeIgnore
+	}
+	if e < s {
+		return 0, 0, errRangeUnsatisfiable
+	}
+	if e >= size {
+		e = size - 1
+	}
+	return s, e - s + 1, nil
 }
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
