@@ -22,6 +22,10 @@ This is a reverse proxy for Google Cloud Storage for performing limited disclosu
 +------------+          +---------------+
 ```
 
+## Download
+
+Download the latest version of gcsproxy from the [Github Releases page](https://github.com/daichirata/gcsproxy/releases).
+
 ## Usage
 
 ```
@@ -73,6 +77,25 @@ COPY --from=build /tmp/gcsproxy /gcsproxy
 CMD ["/gcsproxy"]
 ```
 
+### Pre-built Docker image
+
+Multi-arch images (linux/amd64, linux/arm64) are published to the GitHub Container Registry on every release:
+
+```bash
+docker pull ghcr.io/daichirata/gcsproxy:latest
+```
+
+See the [Packages page](https://github.com/daichirata/gcsproxy/pkgs/container/gcsproxy) for all available tags.
+
+```bash
+docker run \
+    -it --rm \
+    -p 8080:80 \
+    -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
+    -v $(pwd)/../d53ee11da87c.json:/cred.json \
+    ghcr.io/daichirata/gcsproxy:latest
+```
+
 ### Docker image build example
 
 ```bash
@@ -88,7 +111,7 @@ docker run \
     -it --rm \
     -p 8080:80 \
     -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
-    -v $(pwd)/../d53ee11da87c.json:/cred.json gcsproxy 
+    -v $(pwd)/../d53ee11da87c.json:/cred.json gcsproxy
 ```
 
 ### Docker Compose example
