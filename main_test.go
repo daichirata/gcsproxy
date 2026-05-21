@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -759,5 +760,347 @@ func TestProxy_CORSOrigin_Unset(t *testing.T) {
 
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Errorf("Access-Control-Allow-Origin should be unset, got %q", got)
+	}
+}
+
+// --- Range parsing unit tests ---
+
+func TestParseSingleRange(t *testing.T) {
+	const size = 1000
+	cases := []struct {
+		name       string
+		header     string
+		size       int64
+		wantErr    error // nil for satisfiable; errRangeIgnore / errRangeUnsatisfiable otherwise
+		wantStart  int64
+		wantLength int64
+	}{
+		// Satisfiable
+		{"explicit", "bytes=0-499", size, nil, 0, 500},
+		{"explicit middle", "bytes=100-199", size, nil, 100, 100},
+		{"single byte", "bytes=0-0", size, nil, 0, 1},
+		{"open ended", "bytes=500-", size, nil, 500, 500},
+		{"suffix", "bytes=-200", size, nil, 800, 200},
+		{"suffix larger than size", "bytes=-2000", size, nil, 0, 1000},
+		{"end clamped", "bytes=900-2000", size, nil, 900, 100},
+		{"multi-range uses first", "bytes=0-99,200-299", size, nil, 0, 100},
+
+		// Ignored (treated as if no Range header)
+		{"non-bytes unit", "items=0-10", size, errRangeIgnore, 0, 0},
+		{"missing prefix", "0-99", size, errRangeIgnore, 0, 0},
+		{"empty", "", size, errRangeIgnore, 0, 0},
+		{"no dash", "bytes=100", size, errRangeIgnore, 0, 0},
+		{"negative start", "bytes=-0", size, errRangeIgnore, 0, 0},
+		{"non-numeric start", "bytes=abc-100", size, errRangeIgnore, 0, 0},
+		{"non-numeric end", "bytes=0-def", size, errRangeIgnore, 0, 0},
+
+		// Unsatisfiable
+		{"start past end", "bytes=1000-1100", size, errRangeUnsatisfiable, 0, 0},
+		{"start past end (open)", "bytes=1500-", size, errRangeUnsatisfiable, 0, 0},
+		{"end before start", "bytes=500-100", size, errRangeUnsatisfiable, 0, 0},
+		{"zero-size object", "bytes=0-0", 0, errRangeUnsatisfiable, 0, 0},
+		{"zero-size suffix", "bytes=-10", 0, errRangeUnsatisfiable, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start, length, err := parseSingleRange(tc.header, tc.size)
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("err = %v, want %v", err, tc.wantErr)
+			}
+			if err == nil && (start != tc.wantStart || length != tc.wantLength) {
+				t.Errorf("(start, length) = (%d, %d), want (%d, %d)", start, length, tc.wantStart, tc.wantLength)
+			}
+		})
+	}
+}
+
+// --- Range integration tests (via the full handler stack) ---
+
+func TestProxy_Range_Explicit(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=2-5")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Body.String(); got != "2345" {
+		t.Errorf("body = %q, want %q", got, "2345")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 2-5/16" {
+		t.Errorf("Content-Range = %q, want %q", got, "bytes 2-5/16")
+	}
+	if got := rec.Header().Get("Accept-Ranges"); got != "bytes" {
+		t.Errorf("Accept-Ranges = %q, want %q", got, "bytes")
+	}
+}
+
+func TestProxy_Range_Suffix(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=-4")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Body.String(); got != "cdef" {
+		t.Errorf("body = %q, want %q", got, "cdef")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 12-15/16" {
+		t.Errorf("Content-Range = %q, want %q", got, "bytes 12-15/16")
+	}
+}
+
+func TestProxy_Range_OpenEnded(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=10-")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Body.String(); got != "abcdef" {
+		t.Errorf("body = %q, want %q", got, "abcdef")
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 10-15/16" {
+		t.Errorf("Content-Range = %q, want %q", got, "bytes 10-15/16")
+	}
+}
+
+func TestProxy_Range_Unsatisfiable(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=1000-2000")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestedRangeNotSatisfiable)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes */16" {
+		t.Errorf("Content-Range = %q, want %q", got, "bytes */16")
+	}
+}
+
+func TestProxy_FullResponse_AdvertisesAcceptRanges(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Accept-Ranges"); got != "bytes" {
+		t.Errorf("Accept-Ranges = %q, want %q", got, "bytes")
+	}
+}
+
+func TestProxy_Range_WithSourceBucket(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+	s.sourceBucket = testBucket
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testObject, nil)
+	req.Header.Set("Range", "bytes=0-3")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Body.String(); got != "0123" {
+		t.Errorf("body = %q, want %q", got, "0123")
+	}
+}
+
+func TestProxy_Range_HonorsContentLengthFlag(t *testing.T) {
+	// 206 responses follow the same -content-length policy as 200
+	// responses: omitted by default (so large ranges bypass the Cloud Run
+	// 32 MiB non-streamed payload cap via chunked encoding) and emitted
+	// only when -content-length is opted in.
+	body := []byte("0123456789abcdef")
+
+	t.Run("default omits Content-Length", func(t *testing.T) {
+		s := newTestServer(t, []fakestorage.Object{{
+			ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+			Content:     body,
+		}})
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+		req.Header.Set("Range", "bytes=2-5")
+		s.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+		}
+		if got := rec.Header().Get("Content-Length"); got != "" {
+			t.Errorf("Content-Length should be unset by default, got %q", got)
+		}
+	})
+
+	t.Run("opt-in emits Content-Length", func(t *testing.T) {
+		s := newTestServer(t, []fakestorage.Object{{
+			ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+			Content:     body,
+		}})
+		s.contentLength = true
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+		req.Header.Set("Range", "bytes=2-5")
+		s.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+		}
+		if got := rec.Header().Get("Content-Length"); got != "4" {
+			t.Errorf("Content-Length = %q, want %q", got, "4")
+		}
+	})
+}
+
+func TestProxy_Range_GzippedObject_FallsBackToFullBody(t *testing.T) {
+	// Objects stored with Content-Encoding: gzip cannot be served as
+	// partial content reliably (GCS transcodes them, and NewRangeReader
+	// silently ignores the range — verified against real GCS). The
+	// handler should serve the full body with 200 instead of returning a
+	// truncated 206.
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:      testBucket,
+			Name:            testObject,
+			ContentType:     testCType,
+			ContentEncoding: "gzip",
+		},
+		Content: body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=0-3")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (Range over gzipped object should fall back to 200)", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("Content-Range should not be set on the fallback, got %q", got)
+	}
+	// Accept-Ranges: bytes is intentionally omitted for gzip-encoded
+	// objects because partial content is not actually supported (the
+	// handler falls back to full body), so advertising range support
+	// would be misleading.
+	if got := rec.Header().Get("Accept-Ranges"); got != "" {
+		t.Errorf("Accept-Ranges should not be advertised for gzip-encoded objects, got %q", got)
+	}
+}
+
+func TestProxy_Range_NonBytesUnit_Ignored(t *testing.T) {
+	// RFC 7233 §3.1: unknown range units must be ignored — fall back to
+	// a normal 200 response, not 416. This protects against intermediate
+	// proxies or clients that send exotic Range headers.
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "items=0-10")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (non-bytes range unit should be ignored)", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != string(body) {
+		t.Errorf("body = %q, want full body %q", got, body)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("Content-Range should not be set for ignored Range, got %q", got)
+	}
+}
+
+func TestProxy_Range_MalformedHeader_Ignored(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=abc-def")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (malformed Range should be ignored)", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != string(body) {
+		t.Errorf("body = %q, want full body %q", got, body)
+	}
+}
+
+func TestProxy_Range_ForwardsContentEncoding(t *testing.T) {
+	// Non-gzip encodings (br, deflate, etc.) are not transcoded by GCS,
+	// so Range works over the stored bytes. The encoding MUST be forwarded
+	// to the client so they know how to interpret the partial body.
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:      testBucket,
+			Name:            testObject,
+			ContentType:     testCType,
+			ContentEncoding: "br",
+		},
+		Content: body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=0-3")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "br" {
+		t.Errorf("Content-Encoding = %q, want %q", got, "br")
 	}
 }
