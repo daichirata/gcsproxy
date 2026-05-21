@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -609,5 +612,92 @@ func TestProxy_NotFound_MissingPageFallsBackToDefault404(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// --- structured logging tests ---
+
+// installLogger redirects slog.Default() to the given handler for the test
+// duration, restoring the previous default on cleanup.
+func installLogger(t *testing.T, h slog.Handler) {
+	t.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+}
+
+func setVerbose(t *testing.T, enabled bool) {
+	t.Helper()
+	prev := *verbose
+	*verbose = enabled
+	t.Cleanup(func() { *verbose = prev })
+}
+
+func TestAccessLog_JSONFormat(t *testing.T) {
+	srv := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+	installTestClient(t, srv, "")
+	setVerbose(t, true)
+
+	var buf bytes.Buffer
+	installLogger(t, slog.NewJSONHandler(&buf, nil))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	newRouter("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	// Verify the access log was emitted as a single JSON line with the
+	// expected structured fields.
+	logLine := strings.TrimSpace(buf.String())
+	if logLine == "" {
+		t.Fatal("no log output captured")
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(logLine), &entry); err != nil {
+		t.Fatalf("log output is not valid JSON: %v\nraw: %s", err, logLine)
+	}
+	if got := entry["msg"]; got != "access" {
+		t.Errorf("msg = %v, want %q", got, "access")
+	}
+	if got := entry["method"]; got != "GET" {
+		t.Errorf("method = %v, want %q", got, "GET")
+	}
+	if got := entry["status"]; got != float64(http.StatusOK) { // json numbers are float64
+		t.Errorf("status = %v, want %d", got, http.StatusOK)
+	}
+	if got, ok := entry["url"].(string); !ok || !strings.HasSuffix(got, testObject) {
+		t.Errorf("url = %v, want suffix %q", entry["url"], testObject)
+	}
+	if _, ok := entry["elapsed"].(float64); !ok {
+		t.Errorf("elapsed is missing or not a number: %v", entry["elapsed"])
+	}
+}
+
+func TestAccessLog_NotEmittedWithoutVerbose(t *testing.T) {
+	srv := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+	installTestClient(t, srv, "")
+	setVerbose(t, false)
+
+	var buf bytes.Buffer
+	installLogger(t, slog.NewJSONHandler(&buf, nil))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	newRouter("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := strings.TrimSpace(buf.String()); got != "" {
+		t.Errorf("unexpected log output without -v: %q", got)
 	}
 }
