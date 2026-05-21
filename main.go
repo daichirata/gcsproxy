@@ -42,17 +42,24 @@ func main() {
 		spa             = flag.Bool("spa", false, "SPA fallback: serve -i from the bucket root with HTTP 200 for unmatched routes.")
 		notFoundPath    = flag.String("not-found", "", "Object served with HTTP 404 for unmatched routes.")
 		logFormat       = flag.String("log-format", "json", "Log output format: text or json.")
+		logLevel        = flag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 		contentLength   = flag.Bool("content-length", false, "Send the Content-Length header (disables chunked transfer).")
 		corsOrigin      = flag.String("cors-origin", "", "Value for the Access-Control-Allow-Origin header.")
 	)
 	flag.Parse()
 
+	level, err := parseLogLevel(*logLevel)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	handlerOpts := &slog.HandlerOptions{Level: level}
 	var handler slog.Handler
 	switch *logFormat {
 	case "text":
-		handler = slog.NewTextHandler(os.Stderr, nil)
+		handler = slog.NewTextHandler(os.Stderr, handlerOpts)
 	case "json":
-		handler = slog.NewJSONHandler(os.Stderr, nil)
+		handler = slog.NewJSONHandler(os.Stderr, handlerOpts)
 	default:
 		fmt.Fprintf(os.Stderr, "invalid -log-format: %q (want text or json)\n", *logFormat)
 		os.Exit(1)
@@ -417,4 +424,18 @@ func (w *wrapResponseWriter) WriteHeader(status int) {
 func fatal(msg string, args ...any) {
 	slog.Error(msg, args...)
 	os.Exit(1)
+}
+
+func parseLogLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	}
+	return 0, fmt.Errorf("invalid -log-level: %q (want debug, info, warn, or error)", s)
 }
