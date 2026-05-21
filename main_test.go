@@ -707,3 +707,57 @@ func TestProxy_ContentLengthOptIn(t *testing.T) {
 		t.Errorf("Content-Length = %q, want %q", got, wantLen)
 	}
 }
+
+// --- CORS tests ---
+
+func TestProxy_CORSOrigin_Set(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+	s.corsOrigin = "https://example.com"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "https://example.com")
+	}
+}
+
+func TestProxy_CORSOrigin_AppliesToErrorResponses(t *testing.T) {
+	// CORS header must be present even on 404 so the browser surfaces the
+	// real status to JS instead of treating it as an opaque CORS failure.
+	s := newTestServer(t, nil)
+	s.corsOrigin = "*"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "*")
+	}
+}
+
+func TestProxy_CORSOrigin_Unset(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin should be unset, got %q", got)
+	}
+}
