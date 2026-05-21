@@ -1,30 +1,48 @@
 # gcsproxy
 
-Reverse proxy for Google Cloud Storage.
+A lightweight reverse proxy for Google Cloud Storage.
 
-## Description
-
-This is a reverse proxy for Google Cloud Storage for performing limited disclosure (IP address restriction etc...). Gets the URL of the GCS object through its internal API. Therefore, it is possible to make GCS objects private and deliver limited content.
+gcsproxy lets you keep a GCS bucket private while still serving its objects over HTTP, so you can put your own access controls (IP allowlist, basic auth, IAP, etc.) in front of it. It authenticates to GCS using the host's credentials and streams object contents back to the client.
 
 ```
- +---------------------------------------+
- |                Nginx                  |
- |    access control (basic auth/ip)     |
- +-----+---------------------------------+
-       |
------------------------------------------+
-       |
-       |
-+------v-----+          +---------------+
-|            |          |               |
-|  gcsproxy  | +------> | Google Cloud  |
-|            |          |    Storage    |
-+------------+          +---------------+
++-----------------------------+         +------------+         +------------------+
+|           Nginx             |  HTTP   |            |  GCS    |                  |
+|  (auth / IP allow / TLS)    | ------> |  gcsproxy  | ------> |   Google Cloud   |
+|                             |         |            |   API   |     Storage      |
++-----------------------------+         +------------+         +------------------+
 ```
 
-## Download
+## Features
 
-Download the latest version of gcsproxy from the [Github Releases page](https://github.com/daichirata/gcsproxy/releases).
+- Streams GCS objects directly to clients (no temporary files on disk)
+- Forwards `Content-Type`, `Content-Language`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Length`, `Last-Modified`
+- Honors `If-Modified-Since` and replies `304 Not Modified` when appropriate
+- Negotiates `Content-Encoding: gzip` when the client accepts it
+- Optional default index file (`-i`) for serving static sites
+- Optional fixed bucket (`-bucket`) for hosting a single bucket without exposing its name in URLs
+- `/_health` endpoint for liveness/readiness probes
+
+## Installation
+
+### Pre-built binaries
+
+Download the latest release for your platform from the [Releases page](https://github.com/daichirata/gcsproxy/releases).
+
+### Docker image
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to the GitHub Container Registry on every release:
+
+```bash
+docker pull ghcr.io/daichirata/gcsproxy:latest
+```
+
+See the [Packages page](https://github.com/daichirata/gcsproxy/pkgs/container/gcsproxy) for all available tags.
+
+### From source
+
+```bash
+go install github.com/daichirata/gcsproxy@latest
+```
 
 ## Usage
 
@@ -34,159 +52,114 @@ Usage of gcsproxy:
         Bind address (default "127.0.0.1:8080")
   -c string
         The path to the keyfile. If not present, client will use your default application credentials.
+  -bucket string
+        Fixed bucket name. If unset, the bucket is taken from the first path segment.
   -i string
         The default index file to serve.
-  -s string
-        The source bucket name. If not present, bucket name will be extracted from the path.
   -v    Show access log
-
 ```
 
-The default gcsproxy routing configuration is shown below.
+### Routing
 
-`"/{bucket:[0-9a-zA-Z-_.]+}/{object:.*}"`
+By default, the bucket name is taken from the first path segment:
 
-If you are running gcsproxy on localhost:8080 and you want to access the file `gs://test-bucket/your/file/path.txt` in GCS via gcsproxy,
-you can use the URL You can access the file via gcsproxy at the URL `http://localhost:8080/test-bucket/your/file/path.txt`.
+```
+/{bucket}/{object}
+```
 
-Specifying the `-s` option fixes the bucket name to the given value and following routing configuration is used instead.
+For example, with gcsproxy listening on `localhost:8080`, the GCS object `gs://test-bucket/path/to/file.txt` is served at `http://localhost:8080/test-bucket/path/to/file.txt`.
 
-`"/{object:.*}"`
+When `-bucket <name>` is set, that bucket is used for every request and the bucket name is no longer parsed from the URL:
 
-If a default index file is specified and the target object does not exist, an attempt is made to retrieve the object specified in the default index file.
+```
+/{object}
+```
+
+This is useful when gcsproxy is fronting exactly one bucket (e.g. a private static site) and you don't want the bucket name to appear in the path. It also avoids issues with URL-rewriting load balancers and Identity-Aware Proxy, where the rewritten path would otherwise leak into post-auth redirects.
+
+### Default index file
+
+If `-i` is set, requests that don't resolve to an object will fall back to the configured index file:
 
 ```
 gcsproxy -i index.html
 
-http://localhost:8080/test-bucket/foo/bar
-#=> gs://test-bucket/foo/bar/index.html
+GET /test-bucket/foo/bar
+  -> gs://test-bucket/foo/bar/index.html
 ```
 
-## Configurations
+### Health check
 
-**Dockerfile example**
+`/_health` returns `200 OK` with the body `OK`. It does not call GCS and is safe to use as a Kubernetes/Cloud Run liveness or readiness probe.
 
-``` dockerfile
-FROM debian:buster-slim AS build
+### Authentication
 
-WORKDIR /tmp
-ENV GCSPROXY_VERSION=0.3.1
+gcsproxy uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) by default, so on GCE/GKE/Cloud Run it picks up the service account attached to the workload. To use a specific service-account key file, pass `-c /path/to/key.json`.
 
-RUN apt-get update \
-    && apt-get install --no-install-suggests --no-install-recommends --yes ca-certificates wget \
-    && wget https://github.com/daichirata/gcsproxy/releases/download/v${GCSPROXY_VERSION}/gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
-    && tar zxf gcsproxy-${GCSPROXY_VERSION}-linux-amd64.tar.gz \
-    && cp ./gcsproxy-${GCSPROXY_VERSION}-linux-amd64/gcsproxy .
+## Examples
 
-FROM gcr.io/distroless/base
-COPY --from=build /tmp/gcsproxy /gcsproxy
-CMD ["/gcsproxy"]
-```
-
-### Pre-built Docker image
-
-Multi-arch images (linux/amd64, linux/arm64) are published to the GitHub Container Registry on every release:
+### Docker
 
 ```bash
-docker pull ghcr.io/daichirata/gcsproxy:latest
-```
-
-See the [Packages page](https://github.com/daichirata/gcsproxy/pkgs/container/gcsproxy) for all available tags.
-
-```bash
-docker run \
-    -it --rm \
-    -p 8080:80 \
+docker run --rm -p 8080:80 \
     -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
-    -v $(pwd)/../d53ee11da87c.json:/cred.json \
-    ghcr.io/daichirata/gcsproxy:latest
+    -v /path/to/key.json:/cred.json \
+    ghcr.io/daichirata/gcsproxy:latest -v
 ```
 
-### Docker image build example
+### Docker Compose
 
-```bash
-docker build --build-arg GCSPROXY_VERSION=0.4.0 -t gcsproxy .
-```
-
-Example how to run the image
-
-The **d53ee11da87c.json** JSON files contains the Google Cloud Service Account credentials.
-
-```bash
-docker run \
-    -it --rm \
-    -p 8080:80 \
-    -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
-    -v $(pwd)/../d53ee11da87c.json:/cred.json gcsproxy
-```
-
-### Docker Compose example
-
-```dockerfile
-version: '3.3'
-
-networks:
-  web:
-
+```yaml
 services:
   gcsproxy:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        GCSPROXY_VERSION: 0.4.0
-        #HTTPS_PROXY: http://192.168.1.1:8080/
-        #HTTP_PROXY: http://192.168.1.1:8080/
+    image: ghcr.io/daichirata/gcsproxy:latest
     restart: unless-stopped
-    networks:
-      - "web"
     ports:
-      - 8080:80
-    command: -b 0.0.0.0:80 -c /cred.json
-    #environment:
-      #HTTPS_PROXY: http://192.168.1.1:8080/
-      #HTTP_PROXY: http://192.168.1.1:8080/
+      - "8080:80"
+    command: -b 0.0.0.0:80 -v
     volumes:
-      - ./d53ee11da87c.json:/cred.json
+      - ./key.json:/cred.json:ro
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /cred.json
 ```
 
+### systemd
 
-**systemd example**
-
-```
+```ini
 [Unit]
 Description=gcsproxy
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/opt/gcsproxy/gcsproxy -v
-ExecStop=/bin/kill -SIGTERM $MAINPID
+Restart=on-failure
 
 [Install]
-WantedBy = multi-user.target
+WantedBy=multi-user.target
 ```
 
-**nginx.conf**
+### nginx
 
-```
+```nginx
 upstream gcsproxy {
-    server '127.0.0.1:8080';
+    server 127.0.0.1:8080;
 }
 
 server {
     listen 8081;
     server_name _;
 
-    # Logs
     access_log off;
     error_log /var/log/nginx/gcsproxy.error.log error;
 
-    if ($request_method !~ "GET|HEAD|PURGE") {
+    if ($request_method !~ "GET|HEAD") {
         return 405;
     }
 
     location / {
-        proxy_pass http://gcsproxy$uri;
+        proxy_pass http://gcsproxy;
     }
 }
 ```
