@@ -21,13 +21,14 @@ import (
 )
 
 type Server struct {
-	addr         string
-	client       *storage.Client
-	defaultIndex string
-	sourceBucket string
-	spa          bool
-	notFoundPath string
-	verbose      bool
+	addr          string
+	client        *storage.Client
+	defaultIndex  string
+	sourceBucket  string
+	spa           bool
+	notFoundPath  string
+	contentLength bool
+	verbose       bool
 }
 
 func main() {
@@ -39,7 +40,8 @@ func main() {
 		sourceBucket    = flag.String("bucket", "", "Fixed bucket name. If unset, the bucket is taken from the first path segment.")
 		spa             = flag.Bool("spa", false, "Single-page application fallback. When a request does not match an object, serve the -i index file from the bucket root with HTTP 200. Requires -i; mutually exclusive with -not-found.")
 		notFoundPath    = flag.String("not-found", "", "Object path served with HTTP 404 when no object matches the request. Mutually exclusive with -spa.")
-		logFormat       = flag.String("log-format", "text", "Log output format: text or json.")
+		logFormat       = flag.String("log-format", "json", "Log output format: text or json.")
+		contentLength   = flag.Bool("content-length", false, "Send the Content-Length header. By default it is omitted so responses use Transfer-Encoding: chunked, which avoids platform response-size limits (e.g. Cloud Run's 32 MiB cap).")
 	)
 	flag.Parse()
 
@@ -80,13 +82,14 @@ func main() {
 	}
 
 	s := &Server{
-		addr:         *bind,
-		client:       client,
-		defaultIndex: *defaultIndex,
-		sourceBucket: *sourceBucket,
-		spa:          *spa,
-		notFoundPath: *notFoundPath,
-		verbose:      *verbose,
+		addr:          *bind,
+		client:        client,
+		defaultIndex:  *defaultIndex,
+		sourceBucket:  *sourceBucket,
+		spa:           *spa,
+		notFoundPath:  *notFoundPath,
+		contentLength: *contentLength,
+		verbose:       *verbose,
 	}
 
 	if err := s.ListenAndServe(); err != nil {
@@ -221,7 +224,9 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 	setStrHeader(w, "Cache-Control", attrs.CacheControl)
 	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
-	setIntHeader(w, "Content-Length", objr.Attrs.Size)
+	if s.contentLength {
+		setIntHeader(w, "Content-Length", objr.Attrs.Size)
+	}
 	w.WriteHeader(status)
 	io.Copy(w, objr)
 	return nil

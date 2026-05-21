@@ -15,7 +15,7 @@ gcsproxy lets you keep a GCS bucket private while still serving its objects over
 ## Features
 
 - Streams GCS objects directly to clients (no temporary files on disk)
-- Forwards `Content-Type`, `Content-Language`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Length`, `Last-Modified`
+- Forwards `Content-Type`, `Content-Language`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Last-Modified` (and `Content-Length` with `-content-length`)
 - Honors `If-Modified-Since` and replies `304 Not Modified` when appropriate
 - Negotiates `Content-Encoding: gzip` when the client accepts it
 - Optional default index file (`-i`) for serving static sites
@@ -57,10 +57,12 @@ Usage of gcsproxy:
         The path to the keyfile. If not present, client will use your default application credentials.
   -bucket string
         Fixed bucket name. If unset, the bucket is taken from the first path segment.
+  -content-length
+        Send the Content-Length header. By default it is omitted so responses use Transfer-Encoding: chunked, which avoids platform response-size limits (e.g. Cloud Run's 32 MiB cap).
   -i string
         The default index file to serve.
   -log-format string
-        Log output format: text or json. (default "text")
+        Log output format: text or json. (default "json")
   -not-found string
         Object path served with HTTP 404 when no object matches the request. Mutually exclusive with -spa.
   -spa
@@ -123,17 +125,25 @@ GET /test-bucket/missing
 
 ### Logging
 
-gcsproxy uses Go's standard `log/slog` package and writes structured logs to stderr. The `-log-format` flag selects the output encoding:
-
-```
-gcsproxy -log-format json -v
-```
+gcsproxy uses Go's standard `log/slog` package and writes structured logs to stderr. The default `json` format is ready to be ingested by Cloud Logging, Datadog, Loki, and similar aggregation pipelines:
 
 ```json
 {"time":"2026-05-21T09:00:00Z","level":"INFO","msg":"access","remote":"127.0.0.1","elapsed":0.0042,"status":200,"method":"GET","url":"/bucket/foo/bar"}
 ```
 
-The default (`text`) is human-readable `key=value` output. JSON mode is intended for log aggregation pipelines like Cloud Logging, Datadog, or Loki. The access log line is only emitted when `-v` is set.
+Pass `-log-format text` for human-readable `key=value` output when running locally:
+
+```
+gcsproxy -log-format text -v
+```
+
+The access log line is only emitted when `-v` is set.
+
+### Transfer encoding
+
+By default gcsproxy does not emit the `Content-Length` header. `net/http` then uses `Transfer-Encoding: chunked` for any response large enough to matter — which is what platforms like Cloud Run need to bypass their [32 MiB non-streamed response cap](https://cloud.google.com/run/quotas). Small responses may still get an auto-populated `Content-Length` from `net/http`, but that is harmless because they are well below any platform limit.
+
+Pass `-content-length` to opt back into emitting the header for every response, e.g. when clients need to know the total size up front for progress indicators. With this flag, the 32 MiB Cloud Run cap will apply.
 
 ### Health check
 
