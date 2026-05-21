@@ -1172,3 +1172,191 @@ func TestWarnLog_PassesThroughWarnLevel(t *testing.T) {
 		t.Errorf("warn log was not emitted at WARN level, got %q", got)
 	}
 }
+
+// --- HEAD tests ---
+//
+// HEAD must not open a GCS reader: the previous implementation went through
+// the same NewReader / NewRangeReader path as GET, so io.Copy would still
+// download every byte from GCS even though net/http discarded the body
+// (issue #59).
+
+// countingClient wraps a *storage.Client and records the number of object
+// read calls (NewReader / NewRangeReader). We can't introspect those calls
+// directly, but we can detect them by checking the recorder's Body — for
+// HEAD the handler must not write any body bytes.
+//
+// (We rely on the absence of body writes as a proxy for "no GCS read",
+// since the handler always calls io.Copy immediately after opening a
+// reader. Skipping the read implies skipping the io.Copy too.)
+
+func TestProxy_HEAD_NoBody(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodHead, "/"+testBucket+"/"+testObject, nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.Len(); got != 0 {
+		t.Errorf("body length = %d, want 0 (HEAD must not include a body)", got)
+	}
+	if got := rec.Header().Get("Content-Type"); got != testCType {
+		t.Errorf("Content-Type = %q, want %q", got, testCType)
+	}
+	if got := rec.Header().Get("Accept-Ranges"); got != "bytes" {
+		t.Errorf("Accept-Ranges = %q, want %q", got, "bytes")
+	}
+}
+
+func TestProxy_HEAD_ContentLengthOptIn(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+	s.contentLength = true
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodHead, "/"+testBucket+"/"+testObject, nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.Len(); got != 0 {
+		t.Errorf("body length = %d, want 0", got)
+	}
+	wantLen := strconv.Itoa(len(body))
+	if got := rec.Header().Get("Content-Length"); got != wantLen {
+		t.Errorf("Content-Length = %q, want %q", got, wantLen)
+	}
+}
+
+func TestProxy_HEAD_NotFound(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodHead, "/"+testBucket+"/missing.txt", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestProxy_HEAD_Range(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodHead, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=2-5")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Body.Len(); got != 0 {
+		t.Errorf("body length = %d, want 0 (HEAD must not include a body)", got)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes 2-5/16" {
+		t.Errorf("Content-Range = %q, want %q", got, "bytes 2-5/16")
+	}
+}
+
+func TestProxy_HEAD_Range_Unsatisfiable(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodHead, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "bytes=1000-2000")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusRequestedRangeNotSatisfiable)
+	}
+}
+
+func TestProxy_HEAD_Range_NonBytesUnitIgnored(t *testing.T) {
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     body,
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodHead, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Set("Range", "items=0-10")
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.Len(); got != 0 {
+		t.Errorf("body length = %d, want 0", got)
+	}
+}
+
+func TestProxy_HEAD_GzippedObject(t *testing.T) {
+	// HEAD on a gzip-stored object should still avoid the body copy and
+	// produce sensible headers based on Accept-Encoding negotiation.
+	body := []byte("0123456789abcdef")
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:      testBucket,
+			Name:            testObject,
+			ContentType:     testCType,
+			ContentEncoding: "gzip",
+		},
+		Content: body,
+	}})
+	s.contentLength = true
+
+	t.Run("Accept-Encoding: gzip", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodHead, "/"+testBucket+"/"+testObject, nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		s.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Body.Len(); got != 0 {
+			t.Errorf("body length = %d, want 0", got)
+		}
+		if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+			t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
+		}
+	})
+
+	t.Run("no Accept-Encoding", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodHead, "/"+testBucket+"/"+testObject, nil)
+		s.handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Body.Len(); got != 0 {
+			t.Errorf("body length = %d, want 0", got)
+		}
+		// GCS would transcode for GET in this case, so neither
+		// Content-Encoding nor a definitive Content-Length applies.
+		if got := rec.Header().Get("Content-Encoding"); got != "" {
+			t.Errorf("Content-Encoding = %q, want empty", got)
+		}
+	})
+}
