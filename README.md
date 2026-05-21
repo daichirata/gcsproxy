@@ -22,6 +22,7 @@ gcsproxy lets you keep a GCS bucket private while still serving its objects over
 - Optional fixed bucket (`-bucket`) for hosting a single bucket without exposing its name in URLs
 - Optional SPA fallback (`-spa`) that returns the index file with HTTP 200 for unmatched routes
 - Optional custom not-found page (`-not-found`) served with HTTP 404 for unmatched routes
+- Structured logging via `log/slog` with text or JSON output (`-log-format`)
 - `/_health` endpoint for liveness/readiness probes
 
 ## Installation
@@ -58,6 +59,8 @@ Usage of gcsproxy:
         Fixed bucket name. If unset, the bucket is taken from the first path segment.
   -i string
         The default index file to serve.
+  -log-format string
+        Log output format: text or json. (default "text")
   -not-found string
         Object path served with HTTP 404 when no object matches the request. Mutually exclusive with -spa.
   -spa
@@ -117,6 +120,20 @@ gcsproxy -not-found 404.html
 GET /test-bucket/missing
   -> gs://test-bucket/404.html  (HTTP 404)
 ```
+
+### Logging
+
+gcsproxy uses Go's standard `log/slog` package and writes structured logs to stderr. The `-log-format` flag selects the output encoding:
+
+```
+gcsproxy -log-format json -v
+```
+
+```json
+{"time":"2026-05-21T09:00:00Z","level":"INFO","msg":"access","remote":"127.0.0.1","elapsed":0.0042,"status":200,"method":"GET","url":"/bucket/foo/bar"}
+```
+
+The default (`text`) is human-readable `key=value` output. JSON mode is intended for log aggregation pipelines like Cloud Logging, Datadog, or Loki. The access log line is only emitted when `-v` is set.
 
 ### Health check
 

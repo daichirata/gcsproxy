@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +28,7 @@ var (
 	sourceBucket    = flag.String("bucket", "", "Fixed bucket name. If unset, the bucket is taken from the first path segment.")
 	spa             = flag.Bool("spa", false, "Single-page application fallback. When a request does not match an object, serve the -i index file from the bucket root with HTTP 200. Requires -i; mutually exclusive with -not-found.")
 	notFoundPath    = flag.String("not-found", "", "Object path served with HTTP 404 when no object matches the request. Mutually exclusive with -spa.")
+	logFormat       = flag.String("log-format", "text", "Log output format: text or json.")
 )
 
 var client *storage.Client
@@ -89,12 +92,12 @@ func wrapper(fn func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 			addr = ip
 		}
 		if *verbose {
-			log.Printf("[%s] %.3f %d %s %s",
-				addr,
-				time.Now().Sub(proc).Seconds(),
-				writer.status,
-				r.Method,
-				r.URL,
+			slog.Info("access",
+				"remote", addr,
+				"elapsed", time.Since(proc).Seconds(),
+				"status", writer.status,
+				"method", r.Method,
+				"url", r.URL.String(),
 			)
 		}
 	}
@@ -148,7 +151,7 @@ func proxy(w http.ResponseWriter, r *http.Request, bucket, object string) {
 	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
 		last, err := http.ParseTime(lastStrs[0])
 		if *verbose && err != nil {
-			log.Printf("could not parse If-Modified-Since: %v", err)
+			slog.Warn("could not parse If-Modified-Since", "err", err)
 		}
 		if !attrs.Updated.Truncate(time.Second).After(last) {
 			w.WriteHeader(304)
@@ -219,11 +222,23 @@ func newRouter(sourceBucket string) http.Handler {
 func main() {
 	flag.Parse()
 
+	var handler slog.Handler
+	switch *logFormat {
+	case "text":
+		handler = slog.NewTextHandler(os.Stderr, nil)
+	case "json":
+		handler = slog.NewJSONHandler(os.Stderr, nil)
+	default:
+		fmt.Fprintf(os.Stderr, "invalid -log-format: %q (want text or json)\n", *logFormat)
+		os.Exit(1)
+	}
+	slog.SetDefault(slog.New(handler))
+
 	if *spa && *defaultIndex == "" {
-		log.Fatal("-spa requires -i to be set")
+		fatal("-spa requires -i to be set")
 	}
 	if *spa && *notFoundPath != "" {
-		log.Fatal("-spa and -not-found are mutually exclusive")
+		fatal("-spa and -not-found are mutually exclusive")
 	}
 
 	ctx := context.Background()
@@ -234,18 +249,23 @@ func main() {
 			Scopes:          []string{storage.ScopeFullControl},
 		})
 		if err != nil {
-			log.Fatalf("Failed to load credentials: %v", err)
+			fatal("failed to load credentials", "err", err)
 		}
 		opts = append(opts, option.WithAuthCredentials(creds))
 	}
 	var err error
 	client, err = storage.NewClient(ctx, opts...)
 	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+		fatal("failed to create client", "err", err)
 	}
 
-	log.Printf("[service] listening on %s", *bind)
+	slog.Info("listening", "bind", *bind)
 	if err := http.ListenAndServe(*bind, newRouter(*sourceBucket)); err != nil {
-		log.Fatal(err)
+		fatal("server exited", "err", err)
 	}
+}
+
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }
