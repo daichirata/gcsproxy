@@ -93,8 +93,9 @@ func TestWrapResponseWriter(t *testing.T) {
 }
 
 func TestWrapperCapturesCustomStatus(t *testing.T) {
+	s := &Server{}
 	called := false
-	h := wrapper(func(w http.ResponseWriter, r *http.Request) {
+	h := s.wrap(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(http.StatusNotFound)
 		io.WriteString(w, "missing")
@@ -138,9 +139,12 @@ const (
 	testIndexBody = "<html>index</html>"
 )
 
-func newTestServer(t *testing.T, objects []fakestorage.Object) *fakestorage.Server {
+// newTestServer spins up an in-process fake GCS server and returns a Server
+// wired to it. Tests configure the returned Server's fields (defaultIndex,
+// spa, etc.) before calling s.handler().
+func newTestServer(t *testing.T, objects []fakestorage.Object) *Server {
 	t.Helper()
-	srv, err := fakestorage.NewServerWithOptions(fakestorage.Options{
+	fakeSrv, err := fakestorage.NewServerWithOptions(fakestorage.Options{
 		InitialObjects: objects,
 		Scheme:         "http",
 		Host:           "127.0.0.1",
@@ -149,42 +153,14 @@ func newTestServer(t *testing.T, objects []fakestorage.Object) *fakestorage.Serv
 	if err != nil {
 		t.Fatalf("fakestorage.NewServerWithOptions: %v", err)
 	}
-	t.Cleanup(srv.Stop)
-	return srv
-}
-
-// installTestClient replaces the package-level client/flags with values pointing
-// at the fake GCS server, restoring originals on test cleanup.
-func installTestClient(t *testing.T, srv *fakestorage.Server, idx string) {
-	t.Helper()
-	c := srv.Client()
-	prevClient := client
-	prevIdx := *defaultIndex
-	client = c
-	*defaultIndex = idx
-	t.Cleanup(func() {
-		client = prevClient
-		*defaultIndex = prevIdx
-		_ = c.Close()
-	})
-}
-
-func setSPA(t *testing.T, enabled bool) {
-	t.Helper()
-	prev := *spa
-	*spa = enabled
-	t.Cleanup(func() { *spa = prev })
-}
-
-func setNotFoundPath(t *testing.T, path string) {
-	t.Helper()
-	prev := *notFoundPath
-	*notFoundPath = path
-	t.Cleanup(func() { *notFoundPath = prev })
+	t.Cleanup(fakeSrv.Stop)
+	c := fakeSrv.Client()
+	t.Cleanup(func() { _ = c.Close() })
+	return &Server{client: c}
 }
 
 func TestProxy_OK(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        testObject,
@@ -192,11 +168,10 @@ func TestProxy_OK(t *testing.T) {
 		},
 		Content: []byte(testContent),
 	}})
-	installTestClient(t, srv, "")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
@@ -213,15 +188,14 @@ func TestProxy_OK(t *testing.T) {
 }
 
 func TestProxy_NotFound(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: "exists.txt"},
 		Content:     []byte("x"),
 	}})
-	installTestClient(t, srv, "")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d (body=%q)", rec.Code, http.StatusNotFound, rec.Body.String())
@@ -230,7 +204,7 @@ func TestProxy_NotFound(t *testing.T) {
 
 func TestProxy_NotModified(t *testing.T) {
 	updated := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName: testBucket,
 			Name:       testObject,
@@ -238,12 +212,11 @@ func TestProxy_NotModified(t *testing.T) {
 		},
 		Content: []byte(testContent),
 	}})
-	installTestClient(t, srv, "")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
 	req.Header.Set("If-Modified-Since", updated.Format(http.TimeFormat))
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotModified {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
@@ -255,7 +228,7 @@ func TestProxy_NotModified(t *testing.T) {
 
 func TestProxy_ModifiedSinceOlder(t *testing.T) {
 	updated := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName: testBucket,
 			Name:       testObject,
@@ -263,12 +236,11 @@ func TestProxy_ModifiedSinceOlder(t *testing.T) {
 		},
 		Content: []byte(testContent),
 	}})
-	installTestClient(t, srv, "")
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
 	req.Header.Set("If-Modified-Since", updated.Add(-1*time.Hour).Format(http.TimeFormat))
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -279,7 +251,7 @@ func TestProxy_ModifiedSinceOlder(t *testing.T) {
 }
 
 func TestProxy_DefaultIndex_EmptyObject(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        "index.html",
@@ -287,11 +259,11 @@ func TestProxy_DefaultIndex_EmptyObject(t *testing.T) {
 		},
 		Content: []byte(testIndexBody),
 	}})
-	installTestClient(t, srv, "index.html")
+	s.defaultIndex = "index.html"
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/", nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
@@ -302,7 +274,7 @@ func TestProxy_DefaultIndex_EmptyObject(t *testing.T) {
 }
 
 func TestProxy_DefaultIndex_SubdirectoryFallback(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        "foo/index.html",
@@ -310,13 +282,13 @@ func TestProxy_DefaultIndex_SubdirectoryFallback(t *testing.T) {
 		},
 		Content: []byte(testIndexBody),
 	}})
-	installTestClient(t, srv, "index.html")
+	s.defaultIndex = "index.html"
 
 	rec := httptest.NewRecorder()
 	// Request a path that does not exist as an object; fetchObjectAttrs should
 	// retry by appending the default index file ("foo/" + "index.html").
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/foo/", nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
@@ -328,12 +300,11 @@ func TestProxy_DefaultIndex_SubdirectoryFallback(t *testing.T) {
 
 func TestProxy_HealthCheckRoute(t *testing.T) {
 	// Health endpoint must not require GCS credentials.
-	srv := newTestServer(t, nil)
-	installTestClient(t, srv, "")
+	s := newTestServer(t, nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/_health", nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
@@ -342,10 +313,10 @@ func TestProxy_HealthCheckRoute(t *testing.T) {
 	}
 }
 
-// --- source bucket (-s) mode tests ---
+// --- source bucket (-bucket) mode tests ---
 
 func TestProxy_SourceBucket_OK(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        testObject,
@@ -353,12 +324,12 @@ func TestProxy_SourceBucket_OK(t *testing.T) {
 		},
 		Content: []byte(testContent),
 	}})
-	installTestClient(t, srv, "")
+	s.sourceBucket = testBucket
 
 	rec := httptest.NewRecorder()
 	// In source-bucket mode the path no longer carries the bucket name.
 	req := httptest.NewRequest(http.MethodGet, "/"+testObject, nil)
-	newRouter(testBucket).ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
@@ -372,15 +343,15 @@ func TestProxy_SourceBucket_OK(t *testing.T) {
 }
 
 func TestProxy_SourceBucket_NotFound(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: "exists.txt"},
 		Content:     []byte("x"),
 	}})
-	installTestClient(t, srv, "")
+	s.sourceBucket = testBucket
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/missing.txt", nil)
-	newRouter(testBucket).ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d (body=%q)", rec.Code, http.StatusNotFound, rec.Body.String())
@@ -388,7 +359,7 @@ func TestProxy_SourceBucket_NotFound(t *testing.T) {
 }
 
 func TestProxy_SourceBucket_DefaultIndex(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        "index.html",
@@ -396,12 +367,13 @@ func TestProxy_SourceBucket_DefaultIndex(t *testing.T) {
 		},
 		Content: []byte(testIndexBody),
 	}})
-	installTestClient(t, srv, "index.html")
+	s.defaultIndex = "index.html"
+	s.sourceBucket = testBucket
 
 	rec := httptest.NewRecorder()
 	// Root path "/" with default index should resolve to bucket's index.html.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	newRouter(testBucket).ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
@@ -412,10 +384,10 @@ func TestProxy_SourceBucket_DefaultIndex(t *testing.T) {
 }
 
 func TestProxy_SourceBucket_IgnoresPathBucket(t *testing.T) {
-	// When -s is set, the first path segment is part of the object key,
+	// When -bucket is set, the first path segment is part of the object key,
 	// not a bucket selector. A request like "/other-bucket/file.txt" should
 	// look for object "other-bucket/file.txt" in the configured bucket.
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        "other-bucket/file.txt",
@@ -423,11 +395,11 @@ func TestProxy_SourceBucket_IgnoresPathBucket(t *testing.T) {
 		},
 		Content: []byte(testContent),
 	}})
-	installTestClient(t, srv, "")
+	s.sourceBucket = testBucket
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/other-bucket/file.txt", nil)
-	newRouter(testBucket).ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
@@ -438,12 +410,12 @@ func TestProxy_SourceBucket_IgnoresPathBucket(t *testing.T) {
 }
 
 func TestProxy_SourceBucket_HealthCheckStillWorks(t *testing.T) {
-	srv := newTestServer(t, nil)
-	installTestClient(t, srv, "")
+	s := newTestServer(t, nil)
+	s.sourceBucket = testBucket
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/_health", nil)
-	newRouter(testBucket).ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
@@ -455,7 +427,7 @@ func TestProxy_SourceBucket_HealthCheckStillWorks(t *testing.T) {
 // --- SPA fallback (-spa) tests ---
 
 func TestProxy_SPA_FallbackToRootIndex(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        "index.html",
@@ -463,13 +435,13 @@ func TestProxy_SPA_FallbackToRootIndex(t *testing.T) {
 		},
 		Content: []byte(testIndexBody),
 	}})
-	installTestClient(t, srv, "index.html")
-	setSPA(t, true)
+	s.defaultIndex = "index.html"
+	s.spa = true
 
 	rec := httptest.NewRecorder()
 	// Arbitrary path that doesn't exist as an object.
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/some/spa/route", nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
@@ -480,7 +452,7 @@ func TestProxy_SPA_FallbackToRootIndex(t *testing.T) {
 }
 
 func TestProxy_SPA_PassthroughForExistingObject(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{
+	s := newTestServer(t, []fakestorage.Object{
 		{
 			ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
 			Content:     []byte(testContent),
@@ -490,12 +462,12 @@ func TestProxy_SPA_PassthroughForExistingObject(t *testing.T) {
 			Content:     []byte(testIndexBody),
 		},
 	})
-	installTestClient(t, srv, "index.html")
-	setSPA(t, true)
+	s.defaultIndex = "index.html"
+	s.spa = true
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -507,13 +479,13 @@ func TestProxy_SPA_PassthroughForExistingObject(t *testing.T) {
 
 func TestProxy_SPA_NoRootIndexReturns404(t *testing.T) {
 	// SPA enabled but the root index.html itself does not exist.
-	srv := newTestServer(t, nil)
-	installTestClient(t, srv, "index.html")
-	setSPA(t, true)
+	s := newTestServer(t, nil)
+	s.defaultIndex = "index.html"
+	s.spa = true
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/whatever", nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
@@ -521,7 +493,7 @@ func TestProxy_SPA_NoRootIndexReturns404(t *testing.T) {
 }
 
 func TestProxy_SPA_WithSourceBucket(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        "index.html",
@@ -529,12 +501,13 @@ func TestProxy_SPA_WithSourceBucket(t *testing.T) {
 		},
 		Content: []byte(testIndexBody),
 	}})
-	installTestClient(t, srv, "index.html")
-	setSPA(t, true)
+	s.defaultIndex = "index.html"
+	s.spa = true
+	s.sourceBucket = testBucket
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/deep/nested/route", nil)
-	newRouter(testBucket).ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
@@ -548,7 +521,7 @@ func TestProxy_SPA_WithSourceBucket(t *testing.T) {
 
 func TestProxy_NotFound_ServesCustomPage(t *testing.T) {
 	const notFoundBody = "<html>oops</html>"
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
 			Name:        "404.html",
@@ -556,12 +529,11 @@ func TestProxy_NotFound_ServesCustomPage(t *testing.T) {
 		},
 		Content: []byte(notFoundBody),
 	}})
-	installTestClient(t, srv, "")
-	setNotFoundPath(t, "404.html")
+	s.notFoundPath = "404.html"
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusNotFound, rec.Body.String())
@@ -575,7 +547,7 @@ func TestProxy_NotFound_ServesCustomPage(t *testing.T) {
 }
 
 func TestProxy_NotFound_NotInvokedForExistingObject(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{
+	s := newTestServer(t, []fakestorage.Object{
 		{
 			ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
 			Content:     []byte(testContent),
@@ -585,12 +557,11 @@ func TestProxy_NotFound_NotInvokedForExistingObject(t *testing.T) {
 			Content:     []byte("should not be served"),
 		},
 	})
-	installTestClient(t, srv, "")
-	setNotFoundPath(t, "404.html")
+	s.notFoundPath = "404.html"
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -602,13 +573,12 @@ func TestProxy_NotFound_NotInvokedForExistingObject(t *testing.T) {
 
 func TestProxy_NotFound_MissingPageFallsBackToDefault404(t *testing.T) {
 	// The configured not-found object itself doesn't exist in the bucket.
-	srv := newTestServer(t, nil)
-	installTestClient(t, srv, "")
-	setNotFoundPath(t, "404.html")
+	s := newTestServer(t, nil)
+	s.notFoundPath = "404.html"
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
@@ -626,27 +596,19 @@ func installLogger(t *testing.T, h slog.Handler) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 }
 
-func setVerbose(t *testing.T, enabled bool) {
-	t.Helper()
-	prev := *verbose
-	*verbose = enabled
-	t.Cleanup(func() { *verbose = prev })
-}
-
 func TestAccessLog_JSONFormat(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
 		Content:     []byte(testContent),
 	}})
-	installTestClient(t, srv, "")
-	setVerbose(t, true)
+	s.verbose = true
 
 	var buf bytes.Buffer
 	installLogger(t, slog.NewJSONHandler(&buf, nil))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -680,19 +642,18 @@ func TestAccessLog_JSONFormat(t *testing.T) {
 }
 
 func TestAccessLog_NotEmittedWithoutVerbose(t *testing.T) {
-	srv := newTestServer(t, []fakestorage.Object{{
+	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
 		Content:     []byte(testContent),
 	}})
-	installTestClient(t, srv, "")
-	setVerbose(t, false)
+	// s.verbose left as false (zero value)
 
 	var buf bytes.Buffer
 	installLogger(t, slog.NewJSONHandler(&buf, nil))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
-	newRouter("").ServeHTTP(rec, req)
+	s.handler().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
