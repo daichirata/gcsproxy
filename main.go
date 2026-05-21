@@ -24,6 +24,8 @@ var (
 	credentialsFile = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
 	defaultIndex    = flag.String("i", "", "The default index file to serve.")
 	sourceBucket    = flag.String("bucket", "", "Fixed bucket name. If unset, the bucket is taken from the first path segment.")
+	spa             = flag.Bool("spa", false, "Single-page application fallback. When a request does not match an object, serve the -i index file from the bucket root with HTTP 200. Requires -i; mutually exclusive with -not-found.")
+	notFoundPath    = flag.String("not-found", "", "Object path served with HTTP 404 when no object matches the request. Mutually exclusive with -spa.")
 )
 
 var client *storage.Client
@@ -129,6 +131,17 @@ func fetchObjectAttrs(ctx context.Context, bucket, object string) (*storage.Obje
 func proxy(w http.ResponseWriter, r *http.Request, bucket, object string) {
 	attrs, err := fetchObjectAttrs(r.Context(), bucket, object)
 	if err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			if *spa && *defaultIndex != "" {
+				if serveErr := serveObject(w, r, bucket, *defaultIndex, http.StatusOK); serveErr == nil {
+					return
+				}
+			} else if *notFoundPath != "" {
+				if serveErr := serveObject(w, r, bucket, *notFoundPath, http.StatusNotFound); serveErr == nil {
+					return
+				}
+			}
+		}
 		handleError(w, err)
 		return
 	}
@@ -159,6 +172,28 @@ func proxy(w http.ResponseWriter, r *http.Request, bucket, object string) {
 	io.Copy(w, objr)
 }
 
+func serveObject(w http.ResponseWriter, r *http.Request, bucket, object string, status int) error {
+	attrs, err := client.Bucket(bucket).Object(object).Attrs(r.Context())
+	if err != nil {
+		return err
+	}
+	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+	objr, err := client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
+	if err != nil {
+		return err
+	}
+	setTimeHeader(w, "Last-Modified", attrs.Updated)
+	setStrHeader(w, "Content-Type", attrs.ContentType)
+	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
+	setStrHeader(w, "Cache-Control", attrs.CacheControl)
+	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
+	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
+	setIntHeader(w, "Content-Length", objr.Attrs.Size)
+	w.WriteHeader(status)
+	io.Copy(w, objr)
+	return nil
+}
+
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	setStrHeader(w, "Content-Type", "text/plain")
 	io.WriteString(w, "OK\n")
@@ -183,6 +218,13 @@ func newRouter(sourceBucket string) http.Handler {
 
 func main() {
 	flag.Parse()
+
+	if *spa && *defaultIndex == "" {
+		log.Fatal("-spa requires -i to be set")
+	}
+	if *spa && *notFoundPath != "" {
+		log.Fatal("-spa and -not-found are mutually exclusive")
+	}
 
 	ctx := context.Background()
 	var opts []option.ClientOption
