@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -660,5 +661,49 @@ func TestAccessLog_NotEmittedWithoutVerbose(t *testing.T) {
 	}
 	if got := strings.TrimSpace(buf.String()); got != "" {
 		t.Errorf("unexpected log output without -v: %q", got)
+	}
+}
+
+// --- Content-Length / chunked transfer tests ---
+
+func TestProxy_DefaultDoesNotSetContentLength(t *testing.T) {
+	// By default the handler must not emit a Content-Length header itself.
+	// net/http may still auto-fill it for small bodies that fit in its
+	// internal buffer, but for anything large enough to matter (e.g. the
+	// Cloud Run 32 MiB limit) net/http will fall back to chunked encoding.
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "" {
+		t.Errorf("Content-Length should not be set by the handler, got %q", got)
+	}
+}
+
+func TestProxy_ContentLengthOptIn(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+	s.contentLength = true
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	wantLen := strconv.Itoa(len(testContent))
+	if got := rec.Header().Get("Content-Length"); got != wantLen {
+		t.Errorf("Content-Length = %q, want %q", got, wantLen)
 	}
 }
