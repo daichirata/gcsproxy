@@ -54,7 +54,7 @@ dockers:
     use: buildx
     goos: linux
     goarch: amd64
-    dockerfile: Dockerfile.goreleaser
+    dockerfile: Dockerfile
     build_flag_templates:
       - "--platform=linux/amd64"
   - image_templates:
@@ -62,7 +62,7 @@ dockers:
     use: buildx
     goos: linux
     goarch: arm64
-    dockerfile: Dockerfile.goreleaser
+    dockerfile: Dockerfile
     build_flag_templates:
       - "--platform=linux/arm64"
 
