@@ -166,6 +166,20 @@ func installTestClient(t *testing.T, srv *fakestorage.Server, idx string) {
 	})
 }
 
+func setSPA(t *testing.T, enabled bool) {
+	t.Helper()
+	prev := *spa
+	*spa = enabled
+	t.Cleanup(func() { *spa = prev })
+}
+
+func setNotFoundPath(t *testing.T, path string) {
+	t.Helper()
+	prev := *notFoundPath
+	*notFoundPath = path
+	t.Cleanup(func() { *notFoundPath = prev })
+}
+
 func TestProxy_OK(t *testing.T) {
 	srv := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
@@ -432,5 +446,168 @@ func TestProxy_SourceBucket_HealthCheckStillWorks(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "OK") {
 		t.Errorf("body = %q, want to contain %q", rec.Body.String(), "OK")
+	}
+}
+
+// --- SPA fallback (-spa) tests ---
+
+func TestProxy_SPA_FallbackToRootIndex(t *testing.T) {
+	srv := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "index.html",
+			ContentType: "text/html",
+		},
+		Content: []byte(testIndexBody),
+	}})
+	installTestClient(t, srv, "index.html")
+	setSPA(t, true)
+
+	rec := httptest.NewRecorder()
+	// Arbitrary path that doesn't exist as an object.
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/some/spa/route", nil)
+	newRouter("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != testIndexBody {
+		t.Errorf("body = %q, want %q", got, testIndexBody)
+	}
+}
+
+func TestProxy_SPA_PassthroughForExistingObject(t *testing.T) {
+	srv := newTestServer(t, []fakestorage.Object{
+		{
+			ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+			Content:     []byte(testContent),
+		},
+		{
+			ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: "index.html", ContentType: "text/html"},
+			Content:     []byte(testIndexBody),
+		},
+	})
+	installTestClient(t, srv, "index.html")
+	setSPA(t, true)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	newRouter("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want %q (SPA should not override real objects)", got, testContent)
+	}
+}
+
+func TestProxy_SPA_NoRootIndexReturns404(t *testing.T) {
+	// SPA enabled but the root index.html itself does not exist.
+	srv := newTestServer(t, nil)
+	installTestClient(t, srv, "index.html")
+	setSPA(t, true)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/whatever", nil)
+	newRouter("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestProxy_SPA_WithSourceBucket(t *testing.T) {
+	srv := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "index.html",
+			ContentType: "text/html",
+		},
+		Content: []byte(testIndexBody),
+	}})
+	installTestClient(t, srv, "index.html")
+	setSPA(t, true)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/deep/nested/route", nil)
+	newRouter(testBucket).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != testIndexBody {
+		t.Errorf("body = %q, want %q", got, testIndexBody)
+	}
+}
+
+// --- Custom not-found (-not-found) tests ---
+
+func TestProxy_NotFound_ServesCustomPage(t *testing.T) {
+	const notFoundBody = "<html>oops</html>"
+	srv := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "404.html",
+			ContentType: "text/html",
+		},
+		Content: []byte(notFoundBody),
+	}})
+	installTestClient(t, srv, "")
+	setNotFoundPath(t, "404.html")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
+	newRouter("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != notFoundBody {
+		t.Errorf("body = %q, want %q", got, notFoundBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/html" {
+		t.Errorf("Content-Type = %q, want %q", ct, "text/html")
+	}
+}
+
+func TestProxy_NotFound_NotInvokedForExistingObject(t *testing.T) {
+	srv := newTestServer(t, []fakestorage.Object{
+		{
+			ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+			Content:     []byte(testContent),
+		},
+		{
+			ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: "404.html", ContentType: "text/html"},
+			Content:     []byte("should not be served"),
+		},
+	})
+	installTestClient(t, srv, "")
+	setNotFoundPath(t, "404.html")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	newRouter("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want %q", got, testContent)
+	}
+}
+
+func TestProxy_NotFound_MissingPageFallsBackToDefault404(t *testing.T) {
+	// The configured not-found object itself doesn't exist in the bucket.
+	srv := newTestServer(t, nil)
+	installTestClient(t, srv, "")
+	setNotFoundPath(t, "404.html")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
+	newRouter("").ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }

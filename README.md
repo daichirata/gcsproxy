@@ -20,6 +20,8 @@ gcsproxy lets you keep a GCS bucket private while still serving its objects over
 - Negotiates `Content-Encoding: gzip` when the client accepts it
 - Optional default index file (`-i`) for serving static sites
 - Optional fixed bucket (`-bucket`) for hosting a single bucket without exposing its name in URLs
+- Optional SPA fallback (`-spa`) that returns the index file with HTTP 200 for unmatched routes
+- Optional custom not-found page (`-not-found`) served with HTTP 404 for unmatched routes
 - `/_health` endpoint for liveness/readiness probes
 
 ## Installation
@@ -56,6 +58,10 @@ Usage of gcsproxy:
         Fixed bucket name. If unset, the bucket is taken from the first path segment.
   -i string
         The default index file to serve.
+  -not-found string
+        Object path served with HTTP 404 when no object matches the request. Mutually exclusive with -spa.
+  -spa
+        Single-page application fallback. When a request does not match an object, serve the -i index file from the bucket root with HTTP 200. Requires -i; mutually exclusive with -not-found.
   -v    Show access log
 ```
 
@@ -86,6 +92,30 @@ gcsproxy -i index.html
 
 GET /test-bucket/foo/bar
   -> gs://test-bucket/foo/bar/index.html
+```
+
+### SPA fallback
+
+When `-spa` is set together with `-i`, any request that fails to resolve — even after the `-i` lookup — serves the configured index file from the bucket root with HTTP 200. This is the standard pattern for client-side-routed apps (React, Vue, etc.):
+
+```
+gcsproxy -i index.html -spa
+
+GET /test-bucket/some/spa/route
+  -> gs://test-bucket/index.html  (HTTP 200)
+```
+
+This mirrors [Cloudflare Workers'](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/) `not_found_handling = "single-page-application"` and [Netlify's](https://docs.netlify.com/manage/routing/redirects/rewrites-proxies/) `/* /index.html 200` rewrite. `-spa` requires `-i` to be set and is mutually exclusive with `-not-found`.
+
+### Custom not-found page
+
+When `-not-found <path>` is set, requests that fail to resolve serve the given object with HTTP 404 instead of the default plain-text 404. The object's `Content-Type` and other headers are forwarded as-is:
+
+```
+gcsproxy -not-found 404.html
+
+GET /test-bucket/missing
+  -> gs://test-bucket/404.html  (HTTP 404)
 ```
 
 ### Health check
