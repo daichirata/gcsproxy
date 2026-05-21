@@ -22,6 +22,7 @@ gcsproxy lets you keep a GCS bucket private while still serving its objects over
 - Optional fixed bucket (`-bucket`) for hosting a single bucket without exposing its name in URLs
 - Optional SPA fallback (`-spa`) that returns the index file with HTTP 200 for unmatched routes
 - Optional custom not-found page (`-not-found`) served with HTTP 404 for unmatched routes
+- Optional `Access-Control-Allow-Origin` header (`-cors-origin`) for simple CORS use cases
 - Structured logging via `log/slog` with text or JSON output (`-log-format`)
 - `/_health` endpoint for liveness/readiness probes
 
@@ -52,22 +53,24 @@ go install github.com/daichirata/gcsproxy@latest
 ```
 Usage of gcsproxy:
   -b string
-        Bind address (default "127.0.0.1:8080")
-  -c string
-        The path to the keyfile. If not present, client will use your default application credentials.
+        Bind address. (default "127.0.0.1:8080")
   -bucket string
-        Fixed bucket name. If unset, the bucket is taken from the first path segment.
+        Fixed bucket name. Disables bucket extraction from the path.
+  -c string
+        Path to a service-account key file. Defaults to Application Default Credentials.
   -content-length
-        Send the Content-Length header. By default it is omitted so responses use Transfer-Encoding: chunked, which avoids platform response-size limits (e.g. Cloud Run's 32 MiB cap).
+        Send the Content-Length header (disables chunked transfer).
+  -cors-origin string
+        Value for the Access-Control-Allow-Origin header.
   -i string
-        The default index file to serve.
+        Default index file to serve.
   -log-format string
         Log output format: text or json. (default "json")
   -not-found string
-        Object path served with HTTP 404 when no object matches the request. Mutually exclusive with -spa.
+        Object served with HTTP 404 for unmatched routes.
   -spa
-        Single-page application fallback. When a request does not match an object, serve the -i index file from the bucket root with HTTP 200. Requires -i; mutually exclusive with -not-found.
-  -v    Show access log
+        SPA fallback: serve -i from the bucket root with HTTP 200 for unmatched routes.
+  -v    Show access log.
 ```
 
 ### Routing
@@ -144,6 +147,17 @@ The access log line is only emitted when `-v` is set.
 By default gcsproxy does not emit the `Content-Length` header. `net/http` then uses `Transfer-Encoding: chunked` for any response large enough to matter — which is what platforms like Cloud Run need to bypass their [32 MiB non-streamed response cap](https://cloud.google.com/run/quotas). Small responses may still get an auto-populated `Content-Length` from `net/http`, but that is harmless because they are well below any platform limit.
 
 Pass `-content-length` to opt back into emitting the header for every response, e.g. when clients need to know the total size up front for progress indicators. With this flag, the 32 MiB Cloud Run cap will apply.
+
+### CORS
+
+Pass `-cors-origin <value>` to add an `Access-Control-Allow-Origin` header to every response (success and error alike):
+
+```
+gcsproxy -cors-origin '*'
+gcsproxy -cors-origin 'https://example.com'
+```
+
+This is sufficient for [simple cross-origin requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS#simple_requests) — `<img>`, `<link>`, `<video>`, plain `fetch(url)` etc. — which is what most static-site hosting needs. Requests that require a preflight (custom headers, credentialed `fetch`, non-`GET/HEAD/POST` methods) are not supported; front gcsproxy with a proxy like nginx if you need that.
 
 ### Health check
 

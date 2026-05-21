@@ -28,20 +28,22 @@ type Server struct {
 	spa           bool
 	notFoundPath  string
 	contentLength bool
+	corsOrigin    string
 	verbose       bool
 }
 
 func main() {
 	var (
-		bind            = flag.String("b", "127.0.0.1:8080", "Bind address")
-		verbose         = flag.Bool("v", false, "Show access log")
-		credentialsFile = flag.String("c", "", "The path to the keyfile. If not present, client will use your default application credentials.")
-		defaultIndex    = flag.String("i", "", "The default index file to serve.")
-		sourceBucket    = flag.String("bucket", "", "Fixed bucket name. If unset, the bucket is taken from the first path segment.")
-		spa             = flag.Bool("spa", false, "Single-page application fallback. When a request does not match an object, serve the -i index file from the bucket root with HTTP 200. Requires -i; mutually exclusive with -not-found.")
-		notFoundPath    = flag.String("not-found", "", "Object path served with HTTP 404 when no object matches the request. Mutually exclusive with -spa.")
+		bind            = flag.String("b", "127.0.0.1:8080", "Bind address.")
+		verbose         = flag.Bool("v", false, "Show access log.")
+		credentialsFile = flag.String("c", "", "Path to a service-account key file. Defaults to Application Default Credentials.")
+		defaultIndex    = flag.String("i", "", "Default index file to serve.")
+		sourceBucket    = flag.String("bucket", "", "Fixed bucket name. Disables bucket extraction from the path.")
+		spa             = flag.Bool("spa", false, "SPA fallback: serve -i from the bucket root with HTTP 200 for unmatched routes.")
+		notFoundPath    = flag.String("not-found", "", "Object served with HTTP 404 for unmatched routes.")
 		logFormat       = flag.String("log-format", "json", "Log output format: text or json.")
-		contentLength   = flag.Bool("content-length", false, "Send the Content-Length header. By default it is omitted so responses use Transfer-Encoding: chunked, which avoids platform response-size limits (e.g. Cloud Run's 32 MiB cap).")
+		contentLength   = flag.Bool("content-length", false, "Send the Content-Length header (disables chunked transfer).")
+		corsOrigin      = flag.String("cors-origin", "", "Value for the Access-Control-Allow-Origin header.")
 	)
 	flag.Parse()
 
@@ -89,6 +91,7 @@ func main() {
 		spa:           *spa,
 		notFoundPath:  *notFoundPath,
 		contentLength: *contentLength,
+		corsOrigin:    *corsOrigin,
 		verbose:       *verbose,
 	}
 
@@ -122,6 +125,9 @@ func (s *Server) handler() http.Handler {
 func (s *Server) wrap(fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		proc := time.Now()
+		if s.corsOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", s.corsOrigin)
+		}
 		writer := &wrapResponseWriter{
 			ResponseWriter: w,
 			status:         http.StatusOK,
