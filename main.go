@@ -232,22 +232,40 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, obj
 
 func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs, status int) error {
 	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
-	objr, err := s.client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
-	if err != nil {
-		return err
-	}
-	defer objr.Close()
 
 	setTimeHeader(w, "Last-Modified", attrs.Updated)
 	setStrHeader(w, "Content-Type", attrs.ContentType)
 	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
 	setStrHeader(w, "Cache-Control", attrs.CacheControl)
 	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
-	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
-
 	if !strings.EqualFold(attrs.ContentEncoding, "gzip") {
 		setStrHeader(w, "Accept-Ranges", "bytes")
 	}
+
+	if r.Method == http.MethodHead {
+		// Mirror what a matching GET would emit; gzip-stored served without
+		// Accept-Encoding: gzip is transcoded by GCS, so neither field is set.
+		if strings.EqualFold(attrs.ContentEncoding, "gzip") {
+			if gzipAcceptable {
+				setStrHeader(w, "Content-Encoding", attrs.ContentEncoding)
+				if s.contentLength {
+					setIntHeader(w, "Content-Length", attrs.Size)
+				}
+			}
+		} else if s.contentLength {
+			setIntHeader(w, "Content-Length", attrs.Size)
+		}
+		w.WriteHeader(status)
+		return nil
+	}
+
+	objr, err := s.client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
+	if err != nil {
+		return err
+	}
+	defer objr.Close()
+
+	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 	if s.contentLength {
 		setIntHeader(w, "Content-Length", objr.Attrs.Size)
 	}
@@ -258,12 +276,9 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 }
 
 func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs, rangeHeader string) {
-	// GCS transcodes objects stored with Content-Encoding: gzip on download,
-	// which makes Range offsets ambiguous and effectively ignored (verified
-	// empirically). Fall back to a full 200 response in that case so the
-	// client gets a coherent body it can decode and seek itself. Other
-	// encodings (br, deflate, etc.) are not transcoded and Range works
-	// normally over the stored bytes.
+	// GCS transcodes gzip-stored objects on download (verified empirically),
+	// so Range is silently ignored — fall back to a full 200. Other encodings
+	// (br, deflate, ...) are not transcoded and Range works normally.
 	if strings.EqualFold(attrs.ContentEncoding, "gzip") {
 		if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
 			handleError(w, err)
@@ -275,11 +290,9 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	if err != nil {
 		switch {
 		case errors.Is(err, errRangeIgnore):
-			// Non-"bytes" range units MUST be ignored per RFC 9110 §14.2;
-			// we extend the same treatment to byte-ranges that fail to
-			// parse as integers, so a single malformed header (Range:
-			// items=0-10, Range: bytes=abc-def) does not downgrade a
-			// previously-working download into 416.
+			// Per RFC 9110 §14.2 non-"bytes" units must be ignored; we extend
+			// that to unparseable byte-ranges so a malformed header doesn't
+			// downgrade a previously-working download to 416.
 			if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
 				handleError(w, err)
 			}
@@ -291,25 +304,30 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 		}
 	}
 
+	setTimeHeader(w, "Last-Modified", attrs.Updated)
+	setStrHeader(w, "Content-Type", attrs.ContentType)
+	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
+	setStrHeader(w, "Cache-Control", attrs.CacheControl)
+	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
+	setStrHeader(w, "Accept-Ranges", "bytes")
+	setStrHeader(w, "Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, attrs.Size))
+	if s.contentLength {
+		setIntHeader(w, "Content-Length", length)
+	}
+
+	if r.Method == http.MethodHead {
+		setStrHeader(w, "Content-Encoding", attrs.ContentEncoding)
+		w.WriteHeader(http.StatusPartialContent)
+		return
+	}
+
 	objr, err := s.client.Bucket(attrs.Bucket).Object(attrs.Name).NewRangeReader(r.Context(), start, length)
 	if err != nil {
 		handleError(w, err)
 		return
 	}
 	defer objr.Close()
-
-	setTimeHeader(w, "Last-Modified", attrs.Updated)
-	setStrHeader(w, "Content-Type", attrs.ContentType)
-	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
-	setStrHeader(w, "Cache-Control", attrs.CacheControl)
-	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
 	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
-	setStrHeader(w, "Accept-Ranges", "bytes")
-	setStrHeader(w, "Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, attrs.Size))
-
-	if s.contentLength {
-		setIntHeader(w, "Content-Length", length)
-	}
 
 	w.WriteHeader(http.StatusPartialContent)
 	io.Copy(w, objr)
