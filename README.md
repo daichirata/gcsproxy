@@ -1,5 +1,10 @@
 # gcsproxy
 
+[![Test](https://github.com/daichirata/gcsproxy/actions/workflows/test.yaml/badge.svg)](https://github.com/daichirata/gcsproxy/actions/workflows/test.yaml)
+[![Release](https://img.shields.io/github/v/release/daichirata/gcsproxy)](https://github.com/daichirata/gcsproxy/releases/latest)
+[![Go](https://img.shields.io/github/go-mod/go-version/daichirata/gcsproxy)](go.mod)
+[![License](https://img.shields.io/github/license/daichirata/gcsproxy)](LICENSE)
+
 A lightweight reverse proxy for Google Cloud Storage.
 
 gcsproxy lets you keep a GCS bucket private while still serving its objects over HTTP, so you can put your own access controls (IP allowlist, basic auth, IAP, etc.) in front of it. It authenticates to GCS using the host's credentials and streams object contents back to the client.
@@ -10,6 +15,23 @@ gcsproxy lets you keep a GCS bucket private while still serving its objects over
 |  (auth / IP allow / TLS)    | ------> |  gcsproxy  | ------> |   Google Cloud   |
 |                             |         |            |   API   |     Storage      |
 +-----------------------------+         +------------+         +------------------+
+```
+
+## Quick start
+
+Run gcsproxy locally with your existing [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) (set up via `gcloud auth application-default login`):
+
+```bash
+docker run --rm -p 8080:80 \
+    -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
+    -v ~/.config/gcloud/application_default_credentials.json:/cred.json \
+    ghcr.io/daichirata/gcsproxy:latest -b 0.0.0.0:80
+```
+
+Then fetch a private object through the proxy:
+
+```bash
+curl http://localhost:8080/<your-bucket>/<your-object>
 ```
 
 ## Features
