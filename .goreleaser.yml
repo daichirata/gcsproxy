@@ -22,11 +22,11 @@ builds:
         goarch: 386
 
 archives:
-  - formats: ['tar.gz']
+  - formats: [tar.gz]
     wrap_in_directory: true
     format_overrides:
       - goos: windows
-        formats: ['zip']
+        formats: [zip]
     name_template: '{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
     files:
       - LICENSE
@@ -74,6 +74,10 @@ docker_manifests:
       - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}-amd64"
       - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}-arm64"
   - name_template: "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{.Major}}.{{.Minor}}"
+    image_templates:
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}-amd64"
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:latest"
     image_templates:
       - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}-amd64"
       - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}-arm64"

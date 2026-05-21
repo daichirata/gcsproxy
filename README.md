@@ -77,6 +77,25 @@ COPY --from=build /tmp/gcsproxy /gcsproxy
 CMD ["/gcsproxy"]
 ```
 
+### Pre-built Docker image
+
+Multi-arch images (linux/amd64, linux/arm64) are published to the GitHub Container Registry on every release:
+
+```bash
+docker pull ghcr.io/daichirata/gcsproxy:latest
+```
+
+See the [Packages page](https://github.com/daichirata/gcsproxy/pkgs/container/gcsproxy) for all available tags.
+
+```bash
+docker run \
+    -it --rm \
+    -p 8080:80 \
+    -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
+    -v $(pwd)/../d53ee11da87c.json:/cred.json \
+    ghcr.io/daichirata/gcsproxy:latest
+```
+
 ### Docker image build example
 
 ```bash
