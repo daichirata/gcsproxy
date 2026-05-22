@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -131,6 +133,62 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
+func TestIndexCandidates(t *testing.T) {
+	cases := []struct {
+		name      string
+		object    string
+		indexName string
+		walkUp    bool
+		want      []string
+	}{
+		{
+			name:      "single candidate",
+			object:    "foo/bar",
+			indexName: "index.html",
+			walkUp:    false,
+			want:      []string{"foo/bar/index.html"},
+		},
+		{
+			name:      "walk up path and root",
+			object:    "foo/bar/baz",
+			indexName: "index.html",
+			walkUp:    true,
+			want:      []string{"foo/bar/baz/index.html", "foo/bar/index.html", "foo/index.html"},
+		},
+		{
+			name:      "walk up from trailing slash",
+			object:    "foo/bar/",
+			indexName: "index.html",
+			walkUp:    true,
+			want:      []string{"foo/bar/index.html", "foo/index.html"},
+		},
+		{
+			name:      "single segment walk up is unchanged",
+			object:    "search",
+			indexName: "index.html",
+			walkUp:    true,
+			want:      []string{"search/index.html"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := indexCandidates(tc.object, tc.indexName, tc.walkUp)
+			if err != nil {
+				t.Fatalf("indexCandidates() returned error: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("len(got)=%d len(want)=%d; got=%v want=%v", len(got), len(tc.want), got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("candidates[%d]=%q want %q; got=%v want=%v", i, got[i], tc.want[i], got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 // --- proxy / fetchObjectAttrs integration tests (fake-gcs-server) ---
 
 const (
@@ -159,6 +217,19 @@ func newTestServer(t *testing.T, objects []fakestorage.Object) *Server {
 	c := fakeSrv.Client()
 	t.Cleanup(func() { _ = c.Close() })
 	return &Server{client: c}
+}
+
+func newRewriteProxy(t *testing.T, upstreamURL *url.URL, prefix string) *httptest.Server {
+	t.Helper()
+	rp := httputil.NewSingleHostReverseProxy(upstreamURL)
+	baseDirector := rp.Director
+	rp.Director = func(req *http.Request) {
+		baseDirector(req)
+		req.URL.Path = "/" + testBucket + prefix + req.URL.Path
+		req.URL.RawPath = req.URL.Path
+		req.Host = upstreamURL.Host
+	}
+	return httptest.NewServer(rp)
 }
 
 func TestProxy_OK(t *testing.T) {
@@ -296,6 +367,130 @@ func TestProxy_DefaultIndex_SubdirectoryFallback(t *testing.T) {
 		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	if got := rec.Body.String(); got != testIndexBody {
+		t.Errorf("body = %q, want %q", got, testIndexBody)
+	}
+}
+
+func TestProxy_DefaultIndex_WalkUpFallback_Disabled(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "site-assets-gcsproxy/mainnet-site/index.html",
+			ContentType: "text/html",
+		},
+		Content: []byte(testIndexBody),
+	}})
+	s.defaultIndex = "index.html"
+	s.notFoundPath = "404.html"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/site-assets-gcsproxy/mainnet-site/search", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestProxy_DefaultIndex_WalkUpFallback_Enabled(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "site-assets-gcsproxy/mainnet-site/index.html",
+			ContentType: "text/html",
+		},
+		Content: []byte(testIndexBody),
+	}})
+	s.defaultIndex = "index.html"
+	s.walkUpIndex = true
+	s.notFoundPath = "404.html"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/site-assets-gcsproxy/mainnet-site/search", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != testIndexBody {
+		t.Errorf("body = %q, want %q", got, testIndexBody)
+	}
+}
+
+func TestE2E_PrefixRewrite_SearchRouteWithoutWalkUp(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "site-assets-gcsproxy/mainnet-site/index.html",
+			ContentType: "text/html",
+		},
+		Content: []byte(testIndexBody),
+	}})
+	s.defaultIndex = "index.html"
+	s.notFoundPath = "404.html"
+
+	gcsproxyHTTP := httptest.NewServer(s.handler())
+	t.Cleanup(gcsproxyHTTP.Close)
+	upstreamURL, err := url.Parse(gcsproxyHTTP.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(gcsproxyHTTP.URL): %v", err)
+	}
+
+	rewriteProxy := newRewriteProxy(t, upstreamURL, "/site-assets-gcsproxy/mainnet-site")
+	t.Cleanup(rewriteProxy.Close)
+
+	res, err := http.Get(rewriteProxy.URL + "/search?q=test")
+	if err != nil {
+		t.Fatalf("http.Get: %v", err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll: %v", err)
+	}
+
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (body=%q)", res.StatusCode, http.StatusNotFound, string(body))
+	}
+}
+
+func TestE2E_PrefixRewrite_SearchRouteWithWalkUp(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "site-assets-gcsproxy/mainnet-site/index.html",
+			ContentType: "text/html",
+		},
+		Content: []byte(testIndexBody),
+	}})
+	s.defaultIndex = "index.html"
+	s.walkUpIndex = true
+	s.notFoundPath = "404.html"
+
+	gcsproxyHTTP := httptest.NewServer(s.handler())
+	t.Cleanup(gcsproxyHTTP.Close)
+	upstreamURL, err := url.Parse(gcsproxyHTTP.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(gcsproxyHTTP.URL): %v", err)
+	}
+
+	rewriteProxy := newRewriteProxy(t, upstreamURL, "/site-assets-gcsproxy/mainnet-site")
+	t.Cleanup(rewriteProxy.Close)
+
+	res, err := http.Get(rewriteProxy.URL + "/search?q=test")
+	if err != nil {
+		t.Fatalf("http.Get: %v", err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll: %v", err)
+	}
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body=%q)", res.StatusCode, http.StatusOK, string(body))
+	}
+	if got := string(body); got != testIndexBody {
 		t.Errorf("body = %q, want %q", got, testIndexBody)
 	}
 }

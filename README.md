@@ -96,6 +96,8 @@ Usage of gcsproxy:
   -spa
         SPA fallback: serve -i from the bucket root with HTTP 200 for unmatched routes.
   -v    Show access log.
+  -walk-up-index
+        When -i lookup misses, retry parent directories for index files before not-found handling.
 ```
 
 ### Routing
@@ -125,6 +127,16 @@ gcsproxy -i index.html
 
 GET /test-bucket/foo/bar
   -> gs://test-bucket/foo/bar/index.html
+```
+
+When `-walk-up-index` is also set, gcsproxy will retry parent directories while keeping the same bucket/object prefix:
+
+```
+gcsproxy -i index.html -walk-up-index
+
+GET /test-bucket/prefix/site/search
+  -> try gs://test-bucket/prefix/site/search/index.html
+  -> try gs://test-bucket/prefix/site/index.html
 ```
 
 ### SPA fallback

@@ -24,6 +24,7 @@ type Server struct {
 	addr          string
 	client        *storage.Client
 	defaultIndex  string
+	walkUpIndex   bool
 	sourceBucket  string
 	spa           bool
 	notFoundPath  string
@@ -38,6 +39,7 @@ func main() {
 		verbose         = flag.Bool("v", false, "Show access log.")
 		credentialsFile = flag.String("c", "", "Path to a service-account key file. Defaults to Application Default Credentials.")
 		defaultIndex    = flag.String("i", "", "Default index file to serve.")
+		walkUpIndex     = flag.Bool("walk-up-index", false, "When -i lookup misses, retry parent directories for index files before not-found handling.")
 		sourceBucket    = flag.String("bucket", "", "Fixed bucket name. Disables bucket extraction from the path.")
 		spa             = flag.Bool("spa", false, "SPA fallback: serve -i from the bucket root with HTTP 200 for unmatched routes.")
 		notFoundPath    = flag.String("not-found", "", "Object served with HTTP 404 for unmatched routes.")
@@ -94,6 +96,7 @@ func main() {
 		addr:          *bind,
 		client:        client,
 		defaultIndex:  *defaultIndex,
+		walkUpIndex:   *walkUpIndex,
 		sourceBucket:  *sourceBucket,
 		spa:           *spa,
 		notFoundPath:  *notFoundPath,
@@ -211,15 +214,58 @@ func (s *Server) fetchObjectAttrs(ctx context.Context, bucket, object string) (*
 			if s.defaultIndex == "" || indexAppended {
 				return nil, err
 			}
-			object, err = url.JoinPath(object, s.defaultIndex)
-			if err != nil {
-				return nil, err
+			candidates, candidateErr := indexCandidates(object, s.defaultIndex, s.walkUpIndex)
+			if candidateErr != nil {
+				return nil, candidateErr
 			}
-			return s.client.Bucket(bucket).Object(object).Attrs(ctx)
+			for _, candidate := range candidates {
+				attrs, candidateErr := s.client.Bucket(bucket).Object(candidate).Attrs(ctx)
+				if candidateErr == nil {
+					return attrs, nil
+				}
+				if !errors.Is(candidateErr, storage.ErrObjectNotExist) {
+					return nil, candidateErr
+				}
+				err = candidateErr
+			}
+			return nil, err
 		}
 		return nil, err
 	}
 	return attrs, nil
+}
+
+func indexCandidates(object, indexName string, walkUp bool) ([]string, error) {
+	trimmed := strings.TrimSuffix(object, "/")
+	first, err := url.JoinPath(trimmed, indexName)
+	if err != nil {
+		return nil, err
+	}
+	candidates := []string{first}
+	if !walkUp {
+		return candidates, nil
+	}
+
+	ancestor := trimmed
+	for {
+		slash := strings.LastIndex(ancestor, "/")
+		if slash < 0 {
+			break
+		}
+		ancestor = ancestor[:slash]
+		candidate := indexName
+		if ancestor != "" {
+			candidate, err = url.JoinPath(ancestor, indexName)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if candidate != candidates[len(candidates)-1] {
+			candidates = append(candidates, candidate)
+		}
+	}
+
+	return candidates, nil
 }
 
 func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, object string, status int) error {
