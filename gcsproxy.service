@@ -3,8 +3,10 @@ Description=gcsproxy
 
 [Service]
 Type=simple
-ExecStart=/opt/gcsproxy/gcsproxy -v
+ExecStart=/opt/gcsproxy/gcsproxy -v -shutdown-timeout 30s
 ExecStop=/bin/kill -SIGTERM $MAINPID
+# Must exceed shutdown-delay + shutdown-idle-grace-period + shutdown-timeout.
+TimeoutStopSec=45
 
 [Install]
 WantedBy = multi-user.target

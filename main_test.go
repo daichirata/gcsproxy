@@ -1,17 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1554,4 +1560,523 @@ func TestProxy_HEAD_GzippedObject(t *testing.T) {
 			t.Errorf("Content-Encoding = %q, want empty", got)
 		}
 	})
+}
+
+// startShutdownServer runs s.serve with handler h on an ephemeral port.
+// Canceling the returned func stands in for SIGTERM; the returned channel
+// receives serve's return value.
+func startShutdownServer(t *testing.T, s *Server, h http.Handler) (string, context.CancelFunc, <-chan error) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.serve(ctx, ln, h) }()
+	t.Cleanup(cancel)
+	return ln.Addr().String(), cancel, done
+}
+
+func waitServeDone(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve returned %v, want nil", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("server did not shut down")
+	}
+}
+
+// waitListenerClosed polls until new TCP connections are refused, proving
+// the listener is closed.
+func waitListenerClosed(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return
+		}
+		conn.Close()
+		if time.Now().After(deadline) {
+			t.Fatal("listener never closed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func getHealth(t *testing.T, addr string) *http.Response {
+	t.Helper()
+	res, err := http.Get("http://" + addr + "/_health")
+	if err != nil {
+		t.Fatalf("GET /_health: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		t.Fatalf("read /_health body: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusOK)
+	}
+	return res
+}
+
+func TestShutdown_DrainWindowSendsConnectionClose(t *testing.T) {
+	s := newTestServer(t, nil)
+	// Far longer than the test runs, so the drain window is still open when
+	// the assertions execute no matter how slow the runner is. The serve
+	// goroutine is deliberately abandoned mid-drain; the test binary's exit
+	// reaps it, and shutdown completion is covered by the other tests.
+	s.shutdownDelay = 10 * time.Minute
+	addr, cancel, _ := startShutdownServer(t, s, s.handler())
+
+	if res := getHealth(t, addr); res.Close {
+		t.Fatal("response before shutdown carries Connection: close")
+	}
+
+	cancel()
+	// Every drain-window response must be 200 (getHealth asserts that) and
+	// gain Connection: close once draining is visible.
+	deadline := time.Now().Add(30 * time.Second)
+	for !getHealth(t, addr).Close {
+		if time.Now().After(deadline) {
+			t.Fatal("drain-window responses never gained Connection: close")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestShutdown_IdleConnServedAfterListenerClose(t *testing.T) {
+	s := newTestServer(t, nil)
+	// Far longer than the test runs: the idle connection must only be closed
+	// by the early exit after it closes, never by elapsed time. The test
+	// still finishes immediately because serving the idle connection closes
+	// it, which ends the idle-grace wait.
+	s.idleGracePeriod = 10 * time.Minute
+	addr, cancel, done := startShutdownServer(t, s, s.handler())
+
+	conn, br := dialIdleConn(t, addr)
+
+	cancel()
+	waitListenerClosed(t, addr) // also asserts brand-new conns are refused
+
+	// A request on the idle connection during the idle grace period must
+	// still be served, with Connection: close.
+	if _, err := io.WriteString(conn, "GET /_health HTTP/1.1\r\nHost: gcsproxy.test\r\n\r\n"); err != nil {
+		t.Fatalf("write request on idle conn: %v", err)
+	}
+	res, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response on idle conn: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusOK)
+	}
+	if !res.Close {
+		t.Fatal("response after listener close lacks Connection: close")
+	}
+
+	// After that response the server closes the connection cleanly, and with
+	// no connections left the idle-grace wait ends early.
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if _, err := br.ReadByte(); err != io.EOF {
+		t.Fatalf("read after final response = %v, want io.EOF", err)
+	}
+	waitServeDone(t, done)
+}
+
+func TestShutdown_IdleGraceSkippedWhenNoConnections(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.idleGracePeriod = 10 * time.Minute // must be skipped: no connections exist
+	_, cancel, done := startShutdownServer(t, s, s.handler())
+
+	cancel()
+	waitServeDone(t, done) // fails if the wait is not skipped
+}
+
+// dialIdleConn opens a raw keep-alive connection and completes one request on
+// it, leaving it idle like a proxy pool member.
+func dialIdleConn(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	br := bufio.NewReader(conn)
+	if _, err := io.WriteString(conn, "GET /_health HTTP/1.1\r\nHost: gcsproxy.test\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	res, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusOK)
+	}
+	if res.Close {
+		t.Fatal("response before shutdown carries Connection: close")
+	}
+	return conn, br
+}
+
+func TestShutdown_IdleGraceEndsWhenIdleConnsClose(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.idleGracePeriod = 10 * time.Minute // must end early: client closes its conn
+	addr, cancel, done := startShutdownServer(t, s, s.handler())
+
+	conn, _ := dialIdleConn(t, addr)
+
+	cancel()
+	waitListenerClosed(t, addr)
+
+	// The idle connection is still open, so shutdown must keep waiting.
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned %v while an idle connection was open", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	conn.Close()
+	waitServeDone(t, done) // fails if the wait doesn't end early
+}
+
+func TestShutdown_IdleGraceWaitsForAllIdleConns(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.idleGracePeriod = 10 * time.Minute
+	addr, cancel, done := startShutdownServer(t, s, s.handler())
+
+	conn1, _ := dialIdleConn(t, addr)
+	conn2, _ := dialIdleConn(t, addr)
+
+	cancel()
+	waitListenerClosed(t, addr)
+
+	// Closing one of two idle connections must not end the wait.
+	conn1.Close()
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned %v while an idle connection was open", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	conn2.Close()
+	waitServeDone(t, done)
+}
+
+func TestShutdown_IdleConnClosedAfterIdleGraceElapses(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.idleGracePeriod = 100 * time.Millisecond
+	addr, cancel, done := startShutdownServer(t, s, s.handler())
+
+	conn, br := dialIdleConn(t, addr)
+
+	cancel()
+
+	// The client never uses or closes the idle connection, so once the
+	// idle grace period elapses the server closes it.
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if _, err := br.ReadByte(); err != io.EOF {
+		t.Fatalf("read on abandoned idle conn = %v, want io.EOF", err)
+	}
+	waitServeDone(t, done)
+}
+
+func TestShutdown_CompletesAndRefusesNewConnections(t *testing.T) {
+	run := func(t *testing.T, delay, idleGrace time.Duration) {
+		s := newTestServer(t, nil)
+		s.shutdownDelay = delay
+		s.idleGracePeriod = idleGrace
+		addr, cancel, done := startShutdownServer(t, s, s.handler())
+
+		getHealth(t, addr)
+		cancel()
+		waitServeDone(t, done)
+
+		if conn, err := net.Dial("tcp", addr); err == nil {
+			conn.Close()
+			t.Fatal("dial succeeded after shutdown completed")
+		}
+	}
+	t.Run("short delays", func(t *testing.T) { run(t, 20*time.Millisecond, 20*time.Millisecond) })
+	t.Run("zero delays", func(t *testing.T) { run(t, 0, 0) })
+}
+
+func TestShutdown_WaitsForInFlightRequest(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		io.WriteString(w, "done")
+	})
+	s := &Server{shutdownDelay: 20 * time.Millisecond, idleGracePeriod: 20 * time.Millisecond}
+	addr, cancel, done := startShutdownServer(t, s, h)
+
+	type result struct {
+		status int
+		body   string
+		err    error
+	}
+	resc := make(chan result, 1)
+	go func() {
+		res, err := http.Get("http://" + addr + "/")
+		if err != nil {
+			resc <- result{err: err}
+			return
+		}
+		body, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		resc <- result{status: res.StatusCode, body: string(body), err: err}
+	}()
+
+	<-started
+	cancel()
+	waitListenerClosed(t, addr)
+
+	// Shutdown must keep waiting while the request is in flight.
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned %v before the in-flight request completed", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	r := <-resc
+	if r.err != nil {
+		t.Fatalf("in-flight request failed: %v", r.err)
+	}
+	if r.status != http.StatusOK || r.body != "done" {
+		t.Fatalf("in-flight request = %d %q, want %d %q", r.status, r.body, http.StatusOK, "done")
+	}
+	waitServeDone(t, done)
+}
+
+func TestShutdown_TimeoutCompletesInTime(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.shutdownTimeout = 10 * time.Minute // generous: must still exit cleanly
+	addr, cancel, done := startShutdownServer(t, s, s.handler())
+
+	getHealth(t, addr)
+	cancel()
+	waitServeDone(t, done)
+}
+
+func TestShutdown_TimeoutForcesClose(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) }) // unblock the handler goroutine
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	})
+	s := &Server{shutdownTimeout: 100 * time.Millisecond}
+	addr, cancel, done := startShutdownServer(t, s, h)
+
+	errc := make(chan error, 1)
+	go func() {
+		res, err := http.Get("http://" + addr + "/")
+		if err == nil {
+			io.Copy(io.Discard, res.Body)
+			res.Body.Close()
+		}
+		errc <- err
+	}()
+
+	<-started
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "graceful shutdown incomplete") {
+			t.Fatalf("serve returned %v, want graceful shutdown incomplete error", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("server did not shut down after the timeout")
+	}
+	// The stuck request's connection was force-closed without a response.
+	if err := <-errc; err == nil {
+		t.Fatal("stuck in-flight request succeeded, want connection error")
+	}
+}
+
+// --- ListenAndServe / serve error-path tests ---
+
+func TestListenAndServe_CleanShutdown(t *testing.T) {
+	s := &Server{addr: "127.0.0.1:0"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // shutdown begins immediately; all phases have zero durations
+	if err := s.ListenAndServe(ctx); err != nil {
+		t.Fatalf("ListenAndServe = %v, want nil", err)
+	}
+}
+
+func TestListenAndServe_BindError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer ln.Close()
+
+	s := &Server{addr: ln.Addr().String()}
+	if err := s.ListenAndServe(context.Background()); err == nil {
+		t.Fatal("ListenAndServe on an occupied port succeeded, want error")
+	}
+}
+
+func TestServe_ListenerErrorBeforeShutdown(t *testing.T) {
+	s := &Server{}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.serve(context.Background(), ln, s.handler()) }()
+
+	// Killing the listener without canceling ctx makes srv.Serve fail; serve
+	// must return that error instead of waiting for shutdown.
+	ln.Close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("serve returned %v, want net.ErrClosed", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("serve did not return after listener close")
+	}
+}
+
+// --- main() subprocess tests (shutdown flags and signal handling) ---
+
+// TestMain lets the test binary impersonate the gcsproxy binary: with
+// GCSPROXY_RUN_MAIN=1 it runs main() on the test binary's arguments, so
+// subprocess tests can exercise main's flag validation and startup errors
+// for real, including exit codes.
+func TestMain(m *testing.M) {
+	if os.Getenv("GCSPROXY_RUN_MAIN") == "1" {
+		main()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// runMain re-executes the test binary as gcsproxy and returns its stderr and
+// exit code. STORAGE_EMULATOR_HOST lets storage.NewClient succeed without
+// credentials; nothing ever connects to it.
+func runMain(t *testing.T, args ...string) (string, int) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], args...)
+	cmd.Env = append(os.Environ(), "GCSPROXY_RUN_MAIN=1", "STORAGE_EMULATOR_HOST=127.0.0.1:1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return stderr.String(), 0
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("running %v: %v", args, err)
+	}
+	return stderr.String(), ee.ExitCode()
+}
+
+func TestMain_NegativeDurationValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"negative shutdown delay", []string{"-shutdown-delay", "-1s"}},
+		{"negative idle grace period", []string{"-shutdown-idle-grace-period", "-1s"}},
+		{"negative shutdown timeout", []string{"-shutdown-timeout", "-1s"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stderr, code := runMain(t, tc.args...)
+			if code != 1 {
+				t.Errorf("exit code = %d, want 1 (stderr=%q)", code, stderr)
+			}
+			if !strings.Contains(stderr, "must not be negative") {
+				t.Errorf("stderr %q does not contain %q", stderr, "must not be negative")
+			}
+		})
+	}
+}
+
+func TestMain_BindFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer ln.Close()
+
+	stderr, code := runMain(t, "-b", ln.Addr().String())
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1 (stderr=%q)", code, stderr)
+	}
+	if !strings.Contains(stderr, "server exited") {
+		t.Errorf("stderr %q does not contain %q", stderr, "server exited")
+	}
+}
+
+func TestMain_ServesAndShutsDownOnSIGTERM(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-b", "127.0.0.1:0", "-log-format", "text")
+	// STORAGE_EMULATOR_HOST makes storage.NewClient skip credential lookup;
+	// nothing ever connects to it because only /_health is requested.
+	cmd.Env = append(os.Environ(), "GCSPROXY_RUN_MAIN=1", "STORAGE_EMULATOR_HOST=127.0.0.1:1")
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatalf("StderrPipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting gcsproxy: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	// The bound port is only known from the "listening" log line.
+	var addr string
+	scanner := bufio.NewScanner(stderr)
+	// addr must be checked before Scan: with the operands swapped, finding the
+	// address would still block on one more line the child never writes.
+	for addr == "" && scanner.Scan() {
+		line := scanner.Text()
+		if !strings.Contains(line, "msg=listening") {
+			continue
+		}
+		for _, f := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(f, "addr="); ok {
+				addr = v
+			}
+		}
+	}
+	if addr == "" {
+		t.Fatalf("no listening line on stderr (scanner err: %v)", scanner.Err())
+	}
+	go io.Copy(io.Discard, stderr) // keep draining shutdown logs
+
+	getHealth(t, addr)
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("SIGTERM: %v", err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("gcsproxy exited with %v, want exit code 0", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("gcsproxy did not exit after SIGTERM")
+	}
 }
