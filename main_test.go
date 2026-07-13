@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 )
 
@@ -1552,6 +1554,1101 @@ func TestProxy_HEAD_GzippedObject(t *testing.T) {
 		// Content-Encoding nor a definitive Content-Length applies.
 		if got := rec.Header().Get("Content-Encoding"); got != "" {
 			t.Errorf("Content-Encoding = %q, want empty", got)
+		}
+	})
+}
+
+// --- Conditional request tests (ETag / RFC 9110 preconditions) ---
+
+const (
+	testEtag     = "v1abc"
+	testCacheCtl = "max-age=60"
+)
+
+var testUpdated = time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+
+// newETagServer returns a Server backed by a single object with known
+// validators (ETag, Last-Modified, Cache-Control) so conditional tests can
+// assert literal header values.
+func newETagServer(t *testing.T) *Server {
+	t.Helper()
+	return newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:   testBucket,
+			Name:         testObject,
+			ContentType:  testCType,
+			CacheControl: testCacheCtl,
+			Etag:         testEtag,
+			Updated:      testUpdated,
+		},
+		Content: []byte(testContent),
+	}})
+}
+
+// newGzipETagServer stores plaintext gzip-compressed with
+// Content-Encoding: gzip, so fake-gcs-server transcodes it on download
+// exactly like real GCS.
+func newGzipETagServer(t *testing.T, plaintext string) *Server {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(plaintext)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:      testBucket,
+			Name:            testObject,
+			ContentType:     testCType,
+			ContentEncoding: "gzip",
+			Etag:            testEtag,
+			Updated:         testUpdated,
+		},
+		Content: buf.Bytes(),
+	}})
+}
+
+// doRequest performs a request for the standard test object with the given
+// extra headers and returns the recorded response.
+func doRequest(t *testing.T, s *Server, method string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(method, "/"+testBucket+"/"+testObject, nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	s.handler().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestObjectETag(t *testing.T) {
+	cases := []struct {
+		name  string
+		attrs *storage.ObjectAttrs
+		want  string
+	}{
+		{"identity", &storage.ObjectAttrs{Etag: "v1abc"}, `"v1abc"`},
+		{"gzip is weak", &storage.ObjectAttrs{Etag: "v1abc", ContentEncoding: "gzip"}, `W/"v1abc"`},
+		{"gzip case-insensitive", &storage.ObjectAttrs{Etag: "v1abc", ContentEncoding: "GZIP"}, `W/"v1abc"`},
+		{"other encoding stays strong", &storage.ObjectAttrs{Etag: "v1abc", ContentEncoding: "br"}, `"v1abc"`},
+		{"empty etag omitted", &storage.ObjectAttrs{}, ""},
+		{"empty etag gzip omitted", &storage.ObjectAttrs{ContentEncoding: "gzip"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := objectETag(tc.attrs); got != tc.want {
+				t.Errorf("objectETag() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestScanETag(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         string
+		wantETag   string
+		wantRemain string
+	}{
+		{"strong", `"x"`, `"x"`, ""},
+		{"weak", `W/"x"`, `W/"x"`, ""},
+		{"leading whitespace", `  "x"`, `"x"`, ""},
+		{"list remainder", `"a", "b"`, `"a"`, `, "b"`},
+		{"empty opaque tag", `""`, `""`, ""},
+		{"obs-text bytes allowed", "\"caf\xc3\xa9\"", "\"caf\xc3\xa9\"", ""},
+		{"unterminated", `"x`, "", ""},
+		{"missing quotes", `x`, "", ""},
+		{"long but unquoted", `ab`, "", ""},
+		{"lone weak prefix", `W/`, "", ""},
+		{"control char inside", "\"x\x01y\"", "", ""},
+		{"embedded space invalid", `"a b"`, "", ""},
+		{"empty input", ``, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			etag, remain := scanETag(tc.in)
+			if etag != tc.wantETag || remain != tc.wantRemain {
+				t.Errorf("scanETag(%q) = (%q, %q), want (%q, %q)", tc.in, etag, remain, tc.wantETag, tc.wantRemain)
+			}
+		})
+	}
+}
+
+func TestAnyETagMatches(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		target string
+		strong bool
+		want   bool
+	}{
+		{"strong exact", []string{`"x"`}, `"x"`, true, true},
+		{"strong rejects weak header tag", []string{`W/"x"`}, `"x"`, true, false},
+		{"strong rejects weak target", []string{`"x"`}, `W/"x"`, true, false},
+		{"weak accepts weak header tag", []string{`W/"x"`}, `"x"`, false, true},
+		{"weak accepts weak target", []string{`"x"`}, `W/"x"`, false, true},
+		{"identical weak tags fail strong compare", []string{`W/"x"`}, `W/"x"`, true, false},
+		{"identical weak tags pass weak compare", []string{`W/"x"`}, `W/"x"`, false, true},
+		{"mismatch", []string{`"y"`}, `"x"`, true, false},
+		{"list with spaces", []string{`"a", "b" , "x"`}, `"x"`, true, true},
+		{"multiple header values", []string{`"a"`, `"x"`}, `"x"`, true, true},
+		{"star", []string{`*`}, `"x"`, true, true},
+		{"star with empty target", []string{`*`}, ``, true, true},
+		{"empty target never matches tags", []string{`"x"`, `""`}, ``, false, false},
+		{"malformed stops that value", []string{`garbage, "x"`}, `"x"`, true, false},
+		{"malformed value then matching value", []string{`garbage`, `"x"`}, `"x"`, true, true},
+		{"empty values", nil, `"x"`, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := anyETagMatches(tc.values, tc.target, tc.strong); got != tc.want {
+				t.Errorf("anyETagMatches(%q, %q, %v) = %v, want %v", tc.values, tc.target, tc.strong, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIfRangeAllowsPartial(t *testing.T) {
+	attrs := &storage.ObjectAttrs{Etag: "v1abc", Updated: testUpdated}
+	weakAttrs := &storage.ObjectAttrs{Etag: "v1abc", ContentEncoding: "gzip", Updated: testUpdated}
+	noTimeAttrs := &storage.ObjectAttrs{Etag: "v1abc"}
+	cases := []struct {
+		name    string
+		ifRange string
+		attrs   *storage.ObjectAttrs
+		want    bool
+	}{
+		{"absent", "", attrs, true},
+		{"strong match", `"v1abc"`, attrs, true},
+		{"strong mismatch", `"other"`, attrs, false},
+		{"weak tag never matches", `W/"v1abc"`, attrs, false},
+		{"strong tag against weak object tag", `"v1abc"`, weakAttrs, false},
+		{"identical weak tags still never match", `W/"v1abc"`, weakAttrs, false},
+		{"date equal", testUpdated.Format(http.TimeFormat), attrs, true},
+		{"date earlier", testUpdated.Add(-time.Hour).Format(http.TimeFormat), attrs, false},
+		{"date with zero updated", testUpdated.Format(http.TimeFormat), noTimeAttrs, false},
+		{"garbage", "garbage", attrs, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/x", nil)
+			if tc.ifRange != "" {
+				req.Header.Set("If-Range", tc.ifRange)
+			}
+			if got := ifRangeAllowsPartial(req, tc.attrs); got != tc.want {
+				t.Errorf("ifRangeAllowsPartial(If-Range: %q) = %v, want %v", tc.ifRange, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("empty value treated as absent", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.Header.Set("If-Range", "")
+		if !ifRangeAllowsPartial(req, attrs) {
+			t.Error("ifRangeAllowsPartial(If-Range: <empty>) = false, want true")
+		}
+	})
+}
+
+func TestHasETagValues(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{"nil", nil, false},
+		{"single empty", []string{""}, false},
+		{"whitespace only", []string{"  "}, false},
+		{"empty then tag", []string{"", `"x"`}, true},
+		{"tag", []string{`"x"`}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasETagValues(tc.values); got != tc.want {
+				t.Errorf("hasETagValues(%q) = %v, want %v", tc.values, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProxy_ETag_OnGet(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("ETag"); got != `"`+testEtag+`"` {
+		t.Errorf("ETag = %q, want %q", got, `"`+testEtag+`"`)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want %q", got, testContent)
+	}
+}
+
+func TestProxy_ETag_OnHead(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodHead, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("ETag"); got != `"`+testEtag+`"` {
+		t.Errorf("ETag = %q, want %q", got, `"`+testEtag+`"`)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body should be empty, got %q", rec.Body.String())
+	}
+}
+
+func TestProxy_ETag_On206Range(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"Range": "bytes=2-5"})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Header().Get("ETag"); got != `"`+testEtag+`"` {
+		t.Errorf("ETag = %q, want %q", got, `"`+testEtag+`"`)
+	}
+	if got := rec.Body.String(); got != testContent[2:6] {
+		t.Errorf("body = %q, want %q", got, testContent[2:6])
+	}
+	if got := rec.Header().Get("Content-Range"); got == "" {
+		t.Error("Content-Range header is missing")
+	}
+}
+
+func TestProxy_ETag_GzipObject_WeakWithVary(t *testing.T) {
+	const plaintext = "gzip me please, gcsproxy"
+	wantETag := `W/"` + testEtag + `"`
+
+	t.Run("Accept-Encoding gzip", func(t *testing.T) {
+		s := newGzipETagServer(t, plaintext)
+		rec := doRequest(t, s, http.MethodGet, map[string]string{"Accept-Encoding": "gzip"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Header().Get("ETag"); got != wantETag {
+			t.Errorf("ETag = %q, want %q", got, wantETag)
+		}
+		if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
+			t.Errorf("Vary = %q, want %q", got, "Accept-Encoding")
+		}
+		if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+			t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
+		}
+		zr, err := gzip.NewReader(rec.Body)
+		if err != nil {
+			t.Fatalf("body is not gzip: %v", err)
+		}
+		decompressed, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatalf("gunzip: %v", err)
+		}
+		if string(decompressed) != plaintext {
+			t.Errorf("decompressed body = %q, want %q", decompressed, plaintext)
+		}
+	})
+
+	t.Run("no Accept-Encoding", func(t *testing.T) {
+		s := newGzipETagServer(t, plaintext)
+		rec := doRequest(t, s, http.MethodGet, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Header().Get("ETag"); got != wantETag {
+			t.Errorf("ETag = %q, want %q", got, wantETag)
+		}
+		if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
+			t.Errorf("Vary = %q, want %q", got, "Accept-Encoding")
+		}
+		if got := rec.Header().Get("Content-Encoding"); got != "" {
+			t.Errorf("Content-Encoding = %q, want empty (transcoded)", got)
+		}
+		if got := rec.Body.String(); got != plaintext {
+			t.Errorf("body = %q, want %q", got, plaintext)
+		}
+	})
+}
+
+func TestProxy_IfNoneMatch_Match(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-None-Match": `"` + testEtag + `"`})
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotModified)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body should be empty, got %q", rec.Body.String())
+	}
+	// 304 must carry the validators the 200 would have (RFC 9110 §15.4.5).
+	if got := rec.Header().Get("ETag"); got != `"`+testEtag+`"` {
+		t.Errorf("ETag = %q, want %q", got, `"`+testEtag+`"`)
+	}
+	if got := rec.Header().Get("Last-Modified"); got != testUpdated.Format(http.TimeFormat) {
+		t.Errorf("Last-Modified = %q, want %q", got, testUpdated.Format(http.TimeFormat))
+	}
+	if got := rec.Header().Get("Cache-Control"); got != testCacheCtl {
+		t.Errorf("Cache-Control = %q, want %q", got, testCacheCtl)
+	}
+	if got := rec.Header().Get("Vary"); got != "" {
+		t.Errorf("Vary = %q, want empty for non-gzip object", got)
+	}
+}
+
+func TestProxy_IfNoneMatch_WeakFormMatch(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-None-Match": `W/"` + testEtag + `"`})
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d (weak comparison)", rec.Code, http.StatusNotModified)
+	}
+}
+
+func TestProxy_IfNoneMatch_ListMatch(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-None-Match": `"nope", W/"other", "` + testEtag + `"`})
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
+	}
+}
+
+func TestProxy_IfNoneMatch_Star(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-None-Match": "*"})
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
+	}
+}
+
+func TestProxy_IfNoneMatch_Mismatch(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-None-Match": `"stale"`})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want %q", got, testContent)
+	}
+}
+
+func TestProxy_IfNoneMatch_MultipleHeaderLines(t *testing.T) {
+	s := newETagServer(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+	req.Header.Add("If-None-Match", `"a"`)
+	req.Header.Add("If-None-Match", `"`+testEtag+`"`)
+	s.handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d (all header lines must be scanned)", rec.Code, http.StatusNotModified)
+	}
+}
+
+func TestProxy_IfNoneMatch_Malformed(t *testing.T) {
+	s := newETagServer(t)
+	// Unquoted value is not a valid entity-tag: treated as no-match.
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-None-Match": testEtag})
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestProxy_IfNoneMatch_HEAD(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodHead, map[string]string{"If-None-Match": `"` + testEtag + `"`})
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotModified)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body should be empty, got %q", rec.Body.String())
+	}
+}
+
+func TestProxy_IfNoneMatch_GzipVariants(t *testing.T) {
+	const plaintext = "gzip me please, gcsproxy"
+	cases := []struct {
+		name    string
+		inm     string
+		headers map[string]string
+	}{
+		{"weak tag with gzip accept", `W/"` + testEtag + `"`, map[string]string{"Accept-Encoding": "gzip"}},
+		{"weak tag without accept-encoding", `W/"` + testEtag + `"`, nil},
+		{"strong-form tag still matches weakly", `"` + testEtag + `"`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newGzipETagServer(t, plaintext)
+			headers := map[string]string{"If-None-Match": tc.inm}
+			for k, v := range tc.headers {
+				headers[k] = v
+			}
+			rec := doRequest(t, s, http.MethodGet, headers)
+			if rec.Code != http.StatusNotModified {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotModified)
+			}
+			if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
+				t.Errorf("Vary = %q, want %q (304 for gzip object)", got, "Accept-Encoding")
+			}
+		})
+	}
+}
+
+func TestProxy_IfNoneMatch_TakesPrecedenceOverIMS(t *testing.T) {
+	t.Run("INM mismatch ignores satisfied IMS", func(t *testing.T) {
+		s := newETagServer(t)
+		rec := doRequest(t, s, http.MethodGet, map[string]string{
+			"If-None-Match":     `"stale"`,
+			"If-Modified-Since": testUpdated.Format(http.TimeFormat),
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (IMS must be ignored when INM present)", rec.Code, http.StatusOK)
+		}
+		if got := rec.Body.String(); got != testContent {
+			t.Errorf("body = %q, want %q", got, testContent)
+		}
+	})
+
+	t.Run("INM match wins over stale IMS", func(t *testing.T) {
+		s := newETagServer(t)
+		rec := doRequest(t, s, http.MethodGet, map[string]string{
+			"If-None-Match":     `"` + testEtag + `"`,
+			"If-Modified-Since": testUpdated.Add(-time.Hour).Format(http.TimeFormat),
+		})
+		if rec.Code != http.StatusNotModified {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
+		}
+	})
+}
+
+func TestProxy_IfModifiedSince_304_IncludesValidatorHeaders(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"If-Modified-Since": testUpdated.Format(http.TimeFormat),
+	})
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotModified)
+	}
+	if got := rec.Header().Get("ETag"); got != `"`+testEtag+`"` {
+		t.Errorf("ETag = %q, want %q", got, `"`+testEtag+`"`)
+	}
+	if got := rec.Header().Get("Last-Modified"); got != testUpdated.Format(http.TimeFormat) {
+		t.Errorf("Last-Modified = %q, want %q", got, testUpdated.Format(http.TimeFormat))
+	}
+	if got := rec.Header().Get("Cache-Control"); got != testCacheCtl {
+		t.Errorf("Cache-Control = %q, want %q", got, testCacheCtl)
+	}
+	// Representation headers must be absent on 304.
+	if got := rec.Header().Get("Content-Type"); got != "" {
+		t.Errorf("Content-Type = %q, want empty on 304", got)
+	}
+	if got := rec.Header().Get("Accept-Ranges"); got != "" {
+		t.Errorf("Accept-Ranges = %q, want empty on 304", got)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body should be empty, got %q", rec.Body.String())
+	}
+}
+
+func TestProxy_Range_IfNoneMatchMatch_Returns304(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"Range":         "bytes=0-3",
+		"If-None-Match": `"` + testEtag + `"`,
+	})
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want %d (preconditions run before Range)", rec.Code, http.StatusNotModified)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("Content-Range = %q, want empty on 304", got)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body should be empty, got %q", rec.Body.String())
+	}
+}
+
+func TestProxy_IfRange_ETagMatch_Serves206(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"Range":    "bytes=2-5",
+		"If-Range": `"` + testEtag + `"`,
+	})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Body.String(); got != testContent[2:6] {
+		t.Errorf("body = %q, want %q", got, testContent[2:6])
+	}
+}
+
+func TestProxy_IfRange_ETagMismatch_ServesFull200(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"Range":    "bytes=2-5",
+		"If-Range": `"old"`,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (changed validator must disable Range)", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want full body %q", got, testContent)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("Content-Range = %q, want empty", got)
+	}
+}
+
+func TestProxy_IfRange_WeakETag_ServesFull200(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"Range":    "bytes=2-5",
+		"If-Range": `W/"` + testEtag + `"`,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (If-Range requires strong comparison)", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want full body %q", got, testContent)
+	}
+}
+
+func TestProxy_IfRange_DateMatch_Serves206(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"Range":    "bytes=2-5",
+		"If-Range": testUpdated.Format(http.TimeFormat),
+	})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+	}
+	if got := rec.Body.String(); got != testContent[2:6] {
+		t.Errorf("body = %q, want %q", got, testContent[2:6])
+	}
+}
+
+func TestProxy_IfRange_DateMismatch_ServesFull200(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"Range":    "bytes=2-5",
+		"If-Range": testUpdated.Add(-time.Hour).Format(http.TimeFormat),
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (non-matching date must disable Range)", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want full body %q", got, testContent)
+	}
+}
+
+func TestProxy_IfMatch_Match_Serves200(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-Match": `"` + testEtag + `"`})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want %q", got, testContent)
+	}
+}
+
+func TestProxy_IfMatch_Mismatch_Returns412(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-Match": `"stale"`})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusPreconditionFailed)
+	}
+}
+
+func TestProxy_IfMatch_Star_Serves200(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-Match": "*"})
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestProxy_IfMatch_WeakForm_Returns412(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-Match": `W/"` + testEtag + `"`})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Errorf("status = %d, want %d (If-Match requires strong comparison)", rec.Code, http.StatusPreconditionFailed)
+	}
+}
+
+func TestProxy_IfUnmodifiedSince_Satisfied_Serves200(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"If-Unmodified-Since": testUpdated.Format(http.TimeFormat),
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want %q", got, testContent)
+	}
+}
+
+func TestProxy_IfUnmodifiedSince_Stale_Returns412(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"If-Unmodified-Since": testUpdated.Add(-time.Hour).Format(http.TimeFormat),
+	})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusPreconditionFailed)
+	}
+}
+
+func TestProxy_IfMatch_PrecedenceOverIfUnmodifiedSince(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"If-Match":            `"` + testEtag + `"`,
+		"If-Unmodified-Since": testUpdated.Add(-time.Hour).Format(http.TimeFormat),
+	})
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (IUS must be ignored when If-Match present)", rec.Code, http.StatusOK)
+	}
+}
+
+func TestProxy_IfUnmodifiedSince_InvalidDate_Ignored(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"If-Unmodified-Since": "not-a-date",
+	})
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (invalid HTTP-date must be ignored)", rec.Code, http.StatusOK)
+	}
+}
+
+func TestProxy_IfMatch_EmptyHeader_TreatedAsAbsent(t *testing.T) {
+	// A present-but-empty If-Match must not fail the precondition
+	// (net/http semantics for invalid field syntax).
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-Match": ""})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want %q", got, testContent)
+	}
+}
+
+func TestProxy_IfNoneMatch_EmptyHeader_DoesNotDisableIMS(t *testing.T) {
+	// A present-but-empty If-None-Match is treated as absent, so a matching
+	// If-Modified-Since must still produce a 304.
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"If-None-Match":     "",
+		"If-Modified-Since": testUpdated.Format(http.TimeFormat),
+	})
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
+	}
+}
+
+func TestProxy_IfModifiedSince_InvalidDate_Ignored(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"If-Modified-Since": "not-a-date",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (invalid HTTP-date must be ignored)", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != testContent {
+		t.Errorf("body = %q, want %q", got, testContent)
+	}
+}
+
+func TestProxy_Range_IfMatchMismatch_Returns412(t *testing.T) {
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"Range":    "bytes=2-5",
+		"If-Match": `"stale"`,
+	})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want %d (preconditions run before Range)", rec.Code, http.StatusPreconditionFailed)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("Content-Range = %q, want empty on 412", got)
+	}
+}
+
+func TestProxy_IfRange_MatchButRangeUnsatisfiable_Returns416(t *testing.T) {
+	// If-Range only decides whether Range is honored; an in-date validator
+	// with an out-of-bounds range must still produce 416.
+	s := newETagServer(t)
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"Range":    "bytes=9999-",
+		"If-Range": `"` + testEtag + `"`,
+	})
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestedRangeNotSatisfiable)
+	}
+	if got := rec.Header().Get("Content-Range"); !strings.HasPrefix(got, "bytes */") {
+		t.Errorf("Content-Range = %q, want bytes */<size>", got)
+	}
+}
+
+func TestProxy_IfUnmodifiedSince_ExactSecondBoundary(t *testing.T) {
+	// Last-Modified truncates to whole seconds; sub-second object precision
+	// must not turn an equal-second IUS into a spurious 412.
+	updated := testUpdated.Add(300 * time.Millisecond)
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName: testBucket,
+			Name:       testObject,
+			Etag:       testEtag,
+			Updated:    updated,
+		},
+		Content: []byte(testContent),
+	}})
+	rec := doRequest(t, s, http.MethodGet, map[string]string{
+		"If-Unmodified-Since": updated.Truncate(time.Second).Format(http.TimeFormat),
+	})
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestProxy_DateFormats(t *testing.T) {
+	// http.ParseTime accepts the three HTTP-date formats of RFC 9110 §5.6.7.
+	formats := []struct {
+		name   string
+		layout string
+	}{
+		{"IMF-fixdate", http.TimeFormat},
+		{"RFC850", time.RFC850},
+		{"asctime", time.ANSIC},
+	}
+	for _, f := range formats {
+		t.Run(f.name, func(t *testing.T) {
+			t.Run("If-Modified-Since 304", func(t *testing.T) {
+				s := newETagServer(t)
+				rec := doRequest(t, s, http.MethodGet, map[string]string{
+					"If-Modified-Since": testUpdated.Format(f.layout),
+				})
+				if rec.Code != http.StatusNotModified {
+					t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
+				}
+			})
+			t.Run("If-Unmodified-Since 412", func(t *testing.T) {
+				s := newETagServer(t)
+				rec := doRequest(t, s, http.MethodGet, map[string]string{
+					"If-Unmodified-Since": testUpdated.Add(-time.Hour).Format(f.layout),
+				})
+				if rec.Code != http.StatusPreconditionFailed {
+					t.Errorf("status = %d, want %d", rec.Code, http.StatusPreconditionFailed)
+				}
+			})
+			t.Run("If-Range 206", func(t *testing.T) {
+				s := newETagServer(t)
+				rec := doRequest(t, s, http.MethodGet, map[string]string{
+					"Range":    "bytes=2-5",
+					"If-Range": testUpdated.Format(f.layout),
+				})
+				if rec.Code != http.StatusPartialContent {
+					t.Errorf("status = %d, want %d", rec.Code, http.StatusPartialContent)
+				}
+			})
+		})
+	}
+}
+
+func TestCheckPreconditions_ZeroUpdated(t *testing.T) {
+	// Unknown (zero) modification time disables the date conditionals
+	// instead of producing a bogus 304/412. The fake always assigns an
+	// Updated time, so this is exercised at the unit level.
+	s := &Server{}
+	attrs := &storage.ObjectAttrs{Etag: testEtag}
+	cases := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"If-Modified-Since ignored", "If-Modified-Since", testUpdated.Format(http.TimeFormat)},
+		{"If-Unmodified-Since ignored", "If-Unmodified-Since", testUpdated.Add(-time.Hour).Format(http.TimeFormat)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/x", nil)
+			req.Header.Set(tc.key, tc.value)
+			if s.checkPreconditions(rec, req, attrs) {
+				t.Errorf("checkPreconditions wrote %d, want pass-through for zero Updated", rec.Code)
+			}
+		})
+	}
+
+	t.Run("If-None-Match still validates", func(t *testing.T) {
+		// ETag validation is independent of the modification time: a match
+		// must 304 even with zero Updated, just without a Last-Modified.
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		req.Header.Set("If-None-Match", `"`+testEtag+`"`)
+		if !s.checkPreconditions(rec, req, attrs) {
+			t.Fatal("checkPreconditions = false, want 304 written")
+		}
+		if rec.Code != http.StatusNotModified {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
+		}
+		if got := rec.Header().Get("Last-Modified"); got != "" {
+			t.Errorf("Last-Modified = %q, want empty for zero Updated", got)
+		}
+	})
+}
+
+func TestCheckPreconditions_InvalidDate_VerboseWarnLogged(t *testing.T) {
+	s := &Server{verbose: true}
+	attrs := &storage.ObjectAttrs{Etag: testEtag, Updated: testUpdated}
+	cases := []struct {
+		key     string
+		wantLog string
+	}{
+		{"If-Unmodified-Since", "If-Unmodified-Since"},
+		{"If-Modified-Since", "If-Modified-Since"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			var buf bytes.Buffer
+			installLogger(t, slog.NewTextHandler(&buf, nil))
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/x", nil)
+			req.Header.Set(tc.key, "not-a-date")
+			if s.checkPreconditions(rec, req, attrs) {
+				t.Errorf("checkPreconditions wrote %d, want pass-through for invalid date", rec.Code)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Errorf("log output %q does not mention %q", buf.String(), tc.wantLog)
+			}
+		})
+	}
+}
+
+func TestProxy_E2E_DateHeader(t *testing.T) {
+	// The Date header is added by net/http's server, which recorder-based
+	// tests bypass — so drive a real server.
+	s := newETagServer(t)
+	srv := httptest.NewServer(s.handler())
+	defer srv.Close()
+
+	get := func(t *testing.T, inm string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/"+testBucket+"/"+testObject, nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		if inm != "" {
+			req.Header.Set("If-None-Match", inm)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	t.Run("200", func(t *testing.T) {
+		resp := get(t, "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+		if resp.Header.Get("Date") == "" {
+			t.Error("Date header is missing on 200")
+		}
+	})
+
+	t.Run("304", func(t *testing.T) {
+		resp := get(t, `"`+testEtag+`"`)
+		if resp.StatusCode != http.StatusNotModified {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotModified)
+		}
+		if resp.Header.Get("Date") == "" {
+			t.Error("Date header is missing on 304")
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if len(body) != 0 {
+			t.Errorf("body should be empty, got %q", body)
+		}
+	})
+}
+
+func TestProxy_SPA_Fallback_Conditional(t *testing.T) {
+	newSPAServer := func(t *testing.T) *Server {
+		t.Helper()
+		s := newTestServer(t, []fakestorage.Object{{
+			ObjectAttrs: fakestorage.ObjectAttrs{
+				BucketName:  testBucket,
+				Name:        "index.html",
+				ContentType: "text/html",
+				Etag:        "idx1",
+				Updated:     testUpdated,
+			},
+			Content: []byte(testIndexBody),
+		}})
+		s.defaultIndex = "index.html"
+		s.spa = true
+		return s
+	}
+
+	t.Run("first fetch carries index ETag", func(t *testing.T) {
+		s := newSPAServer(t)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/some/spa/route", nil)
+		s.handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Header().Get("ETag"); got != `"idx1"` {
+			t.Errorf("ETag = %q, want %q", got, `"idx1"`)
+		}
+	})
+
+	t.Run("revalidation returns 304", func(t *testing.T) {
+		s := newSPAServer(t)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/some/spa/route", nil)
+		req.Header.Set("If-None-Match", `"idx1"`)
+		s.handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotModified {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotModified)
+		}
+		if rec.Body.Len() != 0 {
+			t.Errorf("body should be empty, got %q", rec.Body.String())
+		}
+	})
+}
+
+func TestProxy_NotFound_Fallback_IgnoresConditionals(t *testing.T) {
+	const notFoundBody = "<html>oops</html>"
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "404.html",
+			ContentType: "text/html",
+			Etag:        "nf1",
+			Updated:     testUpdated,
+		},
+		Content: []byte(notFoundBody),
+	}})
+	s.notFoundPath = "404.html"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
+	// Preconditions apply only to would-be-2xx responses: even validators
+	// matching the 404 page itself must not turn the 404 into a 304/412.
+	req.Header.Set("If-None-Match", `"nf1"`)
+	req.Header.Set("If-Modified-Since", testUpdated.Format(http.TimeFormat))
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if got := rec.Body.String(); got != notFoundBody {
+		t.Errorf("body = %q, want %q", got, notFoundBody)
+	}
+}
+
+func TestProxy_DefaultIndex_ServesResolvedIndexETag(t *testing.T) {
+	newIndexServer := func(t *testing.T) *Server {
+		t.Helper()
+		s := newTestServer(t, []fakestorage.Object{{
+			ObjectAttrs: fakestorage.ObjectAttrs{
+				BucketName:  testBucket,
+				Name:        "foo/index.html",
+				ContentType: "text/html",
+				Etag:        "idx1",
+				Updated:     testUpdated,
+			},
+			Content: []byte(testIndexBody),
+		}})
+		s.defaultIndex = "index.html"
+		return s
+	}
+
+	t.Run("resolved index carries its ETag", func(t *testing.T) {
+		s := newIndexServer(t)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/foo/", nil)
+		s.handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		if got := rec.Header().Get("ETag"); got != `"idx1"` {
+			t.Errorf("ETag = %q, want %q", got, `"idx1"`)
+		}
+	})
+
+	t.Run("revalidation returns 304", func(t *testing.T) {
+		s := newIndexServer(t)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/foo/", nil)
+		req.Header.Set("If-None-Match", `"idx1"`)
+		s.handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotModified {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotModified)
+		}
+	})
+}
+
+func TestProxy_WalkUpIndex_Conditional(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        "foo/index.html",
+			ContentType: "text/html",
+			Etag:        "idx1",
+			Updated:     testUpdated,
+		},
+		Content: []byte(testIndexBody),
+	}})
+	s.defaultIndex = "index.html"
+	s.walkUpIndex = true
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/foo/bar/search", nil)
+	req.Header.Set("If-None-Match", `"idx1"`)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want %d (walk-up resolved index must revalidate)", rec.Code, http.StatusNotModified)
+	}
+	if got := rec.Header().Get("ETag"); got != `"idx1"` {
+		t.Errorf("ETag = %q, want %q", got, `"idx1"`)
+	}
+}
+
+func TestProxy_GenerationPinnedRead_Smoke(t *testing.T) {
+	// Readers are pinned to the attrs' generation; both reader types must
+	// round-trip the generation parameter through the (fake) GCS API.
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName: testBucket,
+			Name:       testObject,
+			Etag:       testEtag,
+			Generation: 1234,
+		},
+		Content: []byte(testContent),
+	}})
+
+	t.Run("full read", func(t *testing.T) {
+		rec := doRequest(t, s, http.MethodGet, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		if got := rec.Body.String(); got != testContent {
+			t.Errorf("body = %q, want %q", got, testContent)
+		}
+	})
+
+	t.Run("range read", func(t *testing.T) {
+		rec := doRequest(t, s, http.MethodGet, map[string]string{"Range": "bytes=2-5"})
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusPartialContent, rec.Body.String())
+		}
+		if got := rec.Body.String(); got != testContent[2:6] {
+			t.Errorf("body = %q, want %q", got, testContent[2:6])
 		}
 	})
 }
