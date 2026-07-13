@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 )
 
@@ -779,6 +780,115 @@ func TestProxy_NotFound_MissingPageFallsBackToDefault404(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// --- error redaction tests ---
+
+func TestProxy_RedactErrors_EmptyBodyOn404(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.redactErrors = true
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if got := rec.Body.String(); got != "" {
+		t.Errorf("body should be empty with -redact-errors, got %q", got)
+	}
+}
+
+func TestProxy_RedactErrors_DisabledKeepsErrorBody(t *testing.T) {
+	s := newTestServer(t, nil)
+	// s.redactErrors left as false (zero value)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, storage.ErrObjectNotExist.Error()) {
+		t.Errorf("body = %q, want to contain %q", got, storage.ErrObjectNotExist.Error())
+	}
+}
+
+func TestProxy_RedactErrors_CORSHeaderStillSet(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.redactErrors = true
+	s.corsOrigin = "*"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "*")
+	}
+}
+
+func TestProxy_ErrorIsLogged(t *testing.T) {
+	// With -log-errors, the full error detail is logged even when the
+	// response body is redacted.
+	s := newTestServer(t, nil)
+	s.redactErrors = true
+	s.logErrors = true
+
+	var buf bytes.Buffer
+	installLogger(t, slog.NewJSONHandler(&buf, nil))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	logLine := strings.TrimSpace(buf.String())
+	if logLine == "" {
+		t.Fatal("no log output captured")
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(logLine), &entry); err != nil {
+		t.Fatalf("log output is not valid JSON: %v\nraw: %s", err, logLine)
+	}
+	if got := entry["msg"]; got != "proxy error" {
+		t.Errorf("msg = %v, want %q", got, "proxy error")
+	}
+	if got := entry["level"]; got != "ERROR" {
+		t.Errorf("level = %v, want %q", got, "ERROR")
+	}
+	if got := entry["status"]; got != float64(http.StatusNotFound) { // json numbers are float64
+		t.Errorf("status = %v, want %d", got, http.StatusNotFound)
+	}
+	if got, ok := entry["err"].(string); !ok || !strings.Contains(got, storage.ErrObjectNotExist.Error()) {
+		t.Errorf("err = %v, want to contain %q", entry["err"], storage.ErrObjectNotExist.Error())
+	}
+}
+
+func TestProxy_ErrorNotLoggedWithoutFlag(t *testing.T) {
+	s := newTestServer(t, nil)
+	// s.logErrors left as false (zero value)
+
+	var buf bytes.Buffer
+	installLogger(t, slog.NewJSONHandler(&buf, nil))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if got := strings.TrimSpace(buf.String()); got != "" {
+		t.Errorf("unexpected log output without -log-errors: %q", got)
 	}
 }
 
