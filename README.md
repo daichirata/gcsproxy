@@ -38,7 +38,7 @@ curl http://localhost:8080/<your-bucket>/<your-object>
 
 - Streams GCS objects directly to clients (no temporary files on disk)
 - Forwards `Content-Type`, `Content-Language`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Last-Modified` (and `Content-Length` with `-content-length`)
-- Honors `If-Modified-Since` and replies `304 Not Modified` when appropriate
+- Emits `ETag` and honors conditional requests — `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since`, `If-Range` — with `304 Not Modified` / `412 Precondition Failed` replies
 - Supports `Range` requests (single range) for partial downloads / video seeking, forwarded to GCS so only the requested bytes traverse the wire
 - Negotiates `Content-Encoding: gzip` when the client accepts it
 - Optional default index file (`-i`) for serving static sites
@@ -206,6 +206,42 @@ This is sufficient for [simple cross-origin requests](https://developer.mozilla.
 
 Requests that require a preflight (custom headers, credentialed `fetch`, non-`GET/HEAD/POST` methods) are not supported; front gcsproxy with a proxy like nginx if you need that.
 
+### Conditional requests
+
+gcsproxy emits the object's [GCS etag](https://cloud.google.com/storage/docs/hashes-etags) as the `ETag` header — it changes whenever the object's content or metadata is rewritten — and evaluates the standard [RFC 9110 preconditions](https://httpwg.org/specs/rfc9110.html#preconditions) against it and `Last-Modified`:
+
+```
+GET /test-bucket/app.js
+
+→ 200 OK
+   ETag: "CJqzl4Ol0PACEAE="
+   Last-Modified: Wed, 04 Mar 2026 05:06:07 GMT
+
+GET /test-bucket/app.js
+If-None-Match: "CJqzl4Ol0PACEAE="
+
+→ 304 Not Modified
+   ETag: "CJqzl4Ol0PACEAE="
+   Last-Modified: Wed, 04 Mar 2026 05:06:07 GMT
+   Cache-Control: <the object's Cache-Control, if any>
+```
+
+Supported preconditions:
+
+- `If-None-Match` (weak comparison, entity-tag lists, `*`) → `304 Not Modified` on match. When present, `If-Modified-Since` is ignored, as RFC 9110 requires.
+- `If-Modified-Since` → `304 Not Modified` when the object has not been modified after the given date.
+- `If-Match` (strong comparison, entity-tag lists, `*`) and `If-Unmodified-Since` → `412 Precondition Failed` when they do not hold. `If-Unmodified-Since` is ignored when `If-Match` is present.
+- `If-Range` — see [Range requests](#range-requests) below.
+
+Details:
+
+- `If-None-Match` uses weak comparison, so intermediaries that weaken the etag survive revalidation: a CDN or cache (nginx gzip filter, Varnish, ...) that recompresses the response downgrades `"abc"` to `W/"abc"`, and a later `If-None-Match: W/"abc"` still produces a `304` from gcsproxy.
+- Preconditions are evaluated before `Range` processing: a range request whose `If-None-Match` matches answers `304` (not `206`), and a failing `If-Match` answers `412`.
+- Date conditionals accept all three HTTP-date formats (IMF-fixdate, RFC 850, asctime) and are compared at the second granularity of `Last-Modified`; invalid dates are ignored per RFC 9110. Malformed entity-tags never match, and a present-but-empty `If-Match`/`If-None-Match` is treated as absent, matching `net/http` semantics.
+- Objects stored with `Content-Encoding: gzip` get a **weak** etag (`W/"…"`) plus `Vary: Accept-Encoding`, because the same URL serves either the raw gzip bytes or the GCS-transcoded body depending on the request's `Accept-Encoding` — two representations that a strong etag must not conflate.
+- Directory requests resolved through the default index file (`-i`, including `-walk-up-index`) and the SPA fallback (`-spa`) revalidate against the *resolved* index object's etag, so clients can cache the app shell. The custom not-found page (`-not-found`) is served with `404` and is never subject to preconditions.
+- Reads are pinned to the generation the validators were derived from, so a concurrent overwrite cannot pair a new body with a stale `ETag`/`Last-Modified`.
+
 ### Range requests
 
 gcsproxy advertises `Accept-Ranges: bytes` on full responses (except for `Content-Encoding: gzip` objects, see below) and serves a single byte range when the client sends a `Range` header:
@@ -227,7 +263,7 @@ Edge cases:
 
 - Range headers with a non-`bytes` unit are ignored and the request is served as a normal `200`, per [RFC 9110 §14.2](https://httpwg.org/specs/rfc9110.html#field.range). The same ignore-and-fall-through applies to byte-ranges that fail to parse as integers.
 - Byte-ranges that fall outside the object — or whose last byte precedes the first (e.g. `bytes=500-100`) — return `416` with a `Content-Range: bytes */<size>` header.
-- `If-Range` is not honored — the range is always served when an in-bounds `Range` header is present.
+- `If-Range` is honored: a strong entity-tag must match the current `ETag` (weak `W/"…"` tags never match), or an HTTP-date must exactly equal `Last-Modified`; otherwise the `Range` header is ignored and the full body is served with `200` — so a resumed download can never mix bytes from two object versions.
 - Objects stored with `Content-Encoding: gzip` cannot be served as partial content (GCS transcodes them and offsets become ambiguous), so the handler falls back to a full `200` body.
 
 ### Health check
