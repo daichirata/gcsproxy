@@ -35,6 +35,8 @@ type Server struct {
 	notFoundPath    string
 	contentLength   bool
 	corsOrigin      string
+	redactErrors    bool
+	logErrors       bool
 	verbose         bool
 	shutdownDelay   time.Duration
 	idleGracePeriod time.Duration
@@ -59,6 +61,8 @@ func main() {
 		shutdownDelay   = flag.Duration("shutdown-delay", 0, "Delay after SIGTERM/SIGINT during which requests are served normally but responses carry Connection: close.")
 		idleGracePeriod = flag.Duration("shutdown-idle-grace-period", 0, "After the listener closes, keep idle connections open for up to this long; ends early once no connections remain.")
 		shutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "Max wait for in-flight requests after the idle grace period; 0 waits indefinitely.")
+		redactErrors    = flag.Bool("redact-errors", false, "Suppress error response bodies.")
+		logErrors       = flag.Bool("log-errors", false, "Log proxy error details at error level.")
 	)
 	flag.Parse()
 
@@ -118,6 +122,8 @@ func main() {
 		notFoundPath:    *notFoundPath,
 		contentLength:   *contentLength,
 		corsOrigin:      *corsOrigin,
+		redactErrors:    *redactErrors,
+		logErrors:       *logErrors,
 		verbose:         *verbose,
 		shutdownDelay:   *shutdownDelay,
 		idleGracePeriod: *idleGracePeriod,
@@ -318,7 +324,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, bucket, object st
 				}
 			}
 		}
-		handleError(w, err)
+		s.handleError(w, err)
 		return
 	}
 	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
@@ -338,7 +344,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, bucket, object st
 	}
 
 	if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-		handleError(w, err)
+		s.handleError(w, err)
 	}
 }
 
@@ -472,7 +478,7 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	// (br, deflate, ...) are not transcoded and Range works normally.
 	if strings.EqualFold(attrs.ContentEncoding, "gzip") {
 		if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-			handleError(w, err)
+			s.handleError(w, err)
 		}
 		return
 	}
@@ -485,7 +491,7 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 			// that to unparseable byte-ranges so a malformed header doesn't
 			// downgrade a previously-working download to 416.
 			if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-				handleError(w, err)
+				s.handleError(w, err)
 			}
 			return
 		case errors.Is(err, errRangeUnsatisfiable):
@@ -514,7 +520,7 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 
 	objr, err := s.client.Bucket(attrs.Bucket).Object(attrs.Name).NewRangeReader(r.Context(), start, length)
 	if err != nil {
-		handleError(w, err)
+		s.handleError(w, err)
 		return
 	}
 	defer objr.Close()
@@ -584,12 +590,19 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "OK\n")
 }
 
-func handleError(w http.ResponseWriter, err error) {
+func (s *Server) handleError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
 	if errors.Is(err, storage.ErrObjectNotExist) {
-		http.Error(w, err.Error(), http.StatusNotFound)
-	} else {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		status = http.StatusNotFound
 	}
+	if s.logErrors {
+		slog.Error("proxy error", "status", status, "err", err)
+	}
+	if s.redactErrors {
+		w.WriteHeader(status)
+		return
+	}
+	http.Error(w, err.Error(), status)
 }
 
 func header(r *http.Request, key string) (string, bool) {

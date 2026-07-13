@@ -88,12 +88,16 @@ Usage of gcsproxy:
         Value for the Access-Control-Allow-Origin header.
   -i string
         Default index file to serve.
+  -log-errors
+        Log proxy error details at error level.
   -log-format string
         Log output format: text or json. (default "json")
   -log-level string
         Minimum log level: debug, info, warn, or error. (default "info")
   -not-found string
         Object served with HTTP 404 for unmatched routes.
+  -redact-errors
+        Suppress error response bodies.
   -shutdown-delay duration
         Delay after SIGTERM/SIGINT during which requests are served normally but responses carry Connection: close.
   -shutdown-idle-grace-period duration
