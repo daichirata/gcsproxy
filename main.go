@@ -30,6 +30,7 @@ type Server struct {
 	notFoundPath  string
 	contentLength bool
 	corsOrigin    string
+	h2c           bool
 	verbose       bool
 }
 
@@ -47,6 +48,7 @@ func main() {
 		logLevel        = flag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 		contentLength   = flag.Bool("content-length", false, "Send the Content-Length header (disables chunked transfer).")
 		corsOrigin      = flag.String("cors-origin", "", "Value for the Access-Control-Allow-Origin header.")
+		h2c             = flag.Bool("h2c", false, "Enable cleartext HTTP/2 (h2c).")
 	)
 	flag.Parse()
 
@@ -102,6 +104,7 @@ func main() {
 		notFoundPath:  *notFoundPath,
 		contentLength: *contentLength,
 		corsOrigin:    *corsOrigin,
+		h2c:           *h2c,
 		verbose:       *verbose,
 	}
 
@@ -112,7 +115,19 @@ func main() {
 
 func (s *Server) ListenAndServe() error {
 	slog.Info("listening", "addr", s.addr)
-	return http.ListenAndServe(s.addr, s.handler())
+	return s.httpServer().ListenAndServe()
+}
+
+func (s *Server) httpServer() *http.Server {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(s.h2c)
+
+	return &http.Server{
+		Addr:      s.addr,
+		Handler:   s.handler(),
+		Protocols: protocols,
+	}
 }
 
 func (s *Server) handler() http.Handler {
