@@ -47,6 +47,7 @@ curl http://localhost:8080/<your-bucket>/<your-object>
 - Optional custom not-found page (`-not-found`) served with HTTP 404 for unmatched routes
 - Optional `Access-Control-Allow-Origin` header (`-cors-origin`) for simple CORS use cases
 - Structured logging via `log/slog` with text or JSON output (`-log-format`)
+- Optional cleartext HTTP/2 (h2c) support (`-h2c`) alongside HTTP/1.1
 - `/_health` endpoint for liveness/readiness probes
 
 ## Installation
@@ -85,6 +86,8 @@ Usage of gcsproxy:
         Send the Content-Length header (disables chunked transfer).
   -cors-origin string
         Value for the Access-Control-Allow-Origin header.
+  -h2c
+        Enable cleartext HTTP/2 (h2c).
   -i string
         Default index file to serve.
   -log-format string
@@ -233,6 +236,10 @@ Edge cases:
 ### Health check
 
 `/_health` returns `200 OK` with the body `OK`. It does not call GCS and is safe to use as a Kubernetes/Cloud Run liveness or readiness probe.
+
+### HTTP/2 cleartext (h2c)
+
+Pass `-h2c` to accept both HTTP/1.1 and HTTP/2 over cleartext TCP (h2c) on the configured bind address. Without this option, only HTTP/1.1 is enabled. This is useful when a TLS-terminating load balancer or reverse proxy forwards HTTP/2 to gcsproxy without re-encrypting the connection.
 
 ### Authentication
 

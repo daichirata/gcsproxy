@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -130,6 +131,73 @@ func TestHealthCheck(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "text/plain" {
 		t.Errorf("Content-Type = %q, want %q", ct, "text/plain")
+	}
+}
+
+func TestServer_H2C(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        testObject,
+			ContentType: testCType,
+		},
+		Content: []byte(testContent),
+	}})
+	s.h2c = true
+
+	srv := s.httpServer()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- srv.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		if err := srv.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+		if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("server.Serve: %v", err)
+		}
+	})
+
+	transport := &http.Transport{Protocols: new(http.Protocols)}
+	transport.Protocols.SetUnencryptedHTTP2(true)
+	client := &http.Client{Transport: transport}
+	t.Cleanup(client.CloseIdleConnections)
+
+	res, err := client.Get("http://" + listener.Addr().String() + "/" + testBucket + "/" + testObject)
+	if err != nil {
+		t.Fatalf("h2c client request: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.ProtoMajor != 2 {
+		t.Fatalf("response protocol = %s, want HTTP/2.0", res.Proto)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll: %v", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body=%q)", res.StatusCode, http.StatusOK, body)
+	}
+	if got := string(body); got != testContent {
+		t.Errorf("body = %q, want %q", got, testContent)
+	}
+}
+
+func TestServer_H2CDisabledByDefault(t *testing.T) {
+	s := &Server{}
+	srv := s.httpServer()
+
+	if got := srv.Protocols.UnencryptedHTTP2(); got {
+		t.Error("UnencryptedHTTP2 is enabled by default, want disabled")
+	}
+	if got := srv.Protocols.HTTP1(); !got {
+		t.Error("HTTP1 is disabled by default, want enabled")
 	}
 }
 
