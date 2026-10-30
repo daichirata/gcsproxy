@@ -977,6 +977,29 @@ func TestProxy_NotFoundNotLoggedAtInfoLevel(t *testing.T) {
 	}
 }
 
+func TestProxy_CanceledRequestNotLoggedAtInfoLevel(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
+		Content:     []byte(testContent),
+	}})
+
+	var buf bytes.Buffer
+	installLogger(t, slog.NewJSONHandler(&buf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil).WithContext(ctx)
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if got := strings.TrimSpace(buf.String()); got != "" {
+		t.Errorf("unexpected log output at info level: %q", got)
+	}
+}
+
 // --- structured logging tests ---
 
 // installLogger redirects slog.Default() to the given handler for the test

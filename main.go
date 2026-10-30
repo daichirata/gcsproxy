@@ -599,8 +599,11 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	status, level := http.StatusInternalServerError, slog.LevelError
-	if errors.Is(err, storage.ErrObjectNotExist) {
+	switch {
+	case errors.Is(err, storage.ErrObjectNotExist):
 		status, level = http.StatusNotFound, slog.LevelDebug
+	case errors.Is(err, context.Canceled):
+		level = slog.LevelDebug
 	}
 	slog.Log(r.Context(), level, "proxy error", "status", status, "url", r.URL.String(), "err", err)
 	msg := err.Error()
