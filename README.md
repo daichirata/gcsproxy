@@ -45,6 +45,7 @@ curl http://localhost:8080/<your-bucket>/<your-object>
 - Optional fixed bucket (`-bucket`) for hosting a single bucket without exposing its name in URLs
 - Optional SPA fallback (`-spa`) that returns the index file with HTTP 200 for unmatched routes
 - Optional custom not-found page (`-not-found`) served with HTTP 404 for unmatched routes
+- Error responses hide GCS error details such as bucket and object names (`-redact-errors`, on by default)
 - Optional `Access-Control-Allow-Origin` header (`-cors-origin`) for simple CORS use cases
 - Structured logging via `log/slog` with text or JSON output (`-log-format`)
 - `/_health` endpoint for liveness/readiness probes
@@ -94,6 +95,8 @@ Usage of gcsproxy:
         Minimum log level: debug, info, warn, or error. (default "info")
   -not-found string
         Object served with HTTP 404 for unmatched routes.
+  -redact-errors
+        Replace error response bodies with the generic HTTP status text. (default true)
   -shutdown-delay duration
         Delay after SIGTERM/SIGINT during which requests are served normally but responses carry Connection: close.
   -shutdown-idle-grace-period duration
@@ -170,6 +173,17 @@ GET /test-bucket/missing
   -> gs://test-bucket/404.html  (HTTP 404)
 ```
 
+### Error responses
+
+GCS error messages can reveal bucket and object names or details about the service account's permissions. By default, error responses carry only the generic status text, and the full error is written to the log instead (see [Logging](#logging)):
+
+```
+GET /test-bucket/missing
+  -> HTTP 404, body "Not Found"
+```
+
+Pass `-redact-errors=false` to return the GCS error message in the response body, e.g. while debugging locally.
+
 ### Logging
 
 gcsproxy uses Go's standard `log/slog` package and writes structured logs to stderr. The default `json` format is ready to be ingested by Cloud Logging, Datadog, Loki, and similar aggregation pipelines:
@@ -190,6 +204,12 @@ The access log line is only emitted when `-v` is set.
 
 ```
 gcsproxy -log-level warn
+```
+
+Failed requests are logged as `proxy error` with the status, URL, and full GCS error. Server errors are logged at `ERROR`; missing objects (404) and requests canceled by the client are logged at `DEBUG`, so pass `-log-level debug` to see them:
+
+```json
+{"time":"2026-05-21T09:00:00Z","level":"ERROR","msg":"proxy error","status":500,"url":"/bucket/foo/bar","err":"googleapi: Error 403: ..."}
 ```
 
 ### Transfer encoding
