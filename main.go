@@ -61,8 +61,8 @@ func main() {
 		shutdownDelay   = flag.Duration("shutdown-delay", 0, "Delay after SIGTERM/SIGINT during which requests are served normally but responses carry Connection: close.")
 		idleGracePeriod = flag.Duration("shutdown-idle-grace-period", 0, "After the listener closes, keep idle connections open for up to this long; ends early once no connections remain.")
 		shutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "Max wait for in-flight requests after the idle grace period; 0 waits indefinitely.")
-		redactErrors    = flag.Bool("redact-errors", false, "Suppress error response bodies.")
-		logErrors       = flag.Bool("log-errors", false, "Log proxy error details at error level.")
+		redactErrors    = flag.Bool("redact-errors", false, "Replace error response bodies with the generic HTTP status text.")
+		logErrors       = flag.Bool("log-errors", false, "Log proxy error details (404 at warn, others at error).")
 	)
 	flag.Parse()
 
@@ -324,7 +324,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, bucket, object st
 				}
 			}
 		}
-		s.handleError(w, err)
+		s.handleError(w, r, err)
 		return
 	}
 	if lastStrs, ok := r.Header["If-Modified-Since"]; ok && len(lastStrs) > 0 {
@@ -344,7 +344,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, bucket, object st
 	}
 
 	if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-		s.handleError(w, err)
+		s.handleError(w, r, err)
 	}
 }
 
@@ -430,6 +430,18 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, obj
 func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs, status int) error {
 	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
 
+	// Open the reader before setting any header so that a failure leaves the
+	// response clean for handleError.
+	var objr *storage.Reader
+	if r.Method != http.MethodHead {
+		var err error
+		objr, err = s.client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
+		if err != nil {
+			return err
+		}
+		defer objr.Close()
+	}
+
 	setTimeHeader(w, "Last-Modified", attrs.Updated)
 	setStrHeader(w, "Content-Type", attrs.ContentType)
 	setStrHeader(w, "Content-Language", attrs.ContentLanguage)
@@ -456,12 +468,6 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 		return nil
 	}
 
-	objr, err := s.client.Bucket(attrs.Bucket).Object(attrs.Name).ReadCompressed(gzipAcceptable).NewReader(r.Context())
-	if err != nil {
-		return err
-	}
-	defer objr.Close()
-
 	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 	if s.contentLength {
 		setIntHeader(w, "Content-Length", objr.Attrs.Size)
@@ -478,7 +484,7 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	// (br, deflate, ...) are not transcoded and Range works normally.
 	if strings.EqualFold(attrs.ContentEncoding, "gzip") {
 		if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-			s.handleError(w, err)
+			s.handleError(w, r, err)
 		}
 		return
 	}
@@ -491,7 +497,7 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 			// that to unparseable byte-ranges so a malformed header doesn't
 			// downgrade a previously-working download to 416.
 			if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-				s.handleError(w, err)
+				s.handleError(w, r, err)
 			}
 			return
 		case errors.Is(err, errRangeUnsatisfiable):
@@ -499,6 +505,16 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 			http.Error(w, "Requested Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
+	}
+
+	var objr *storage.Reader
+	if r.Method != http.MethodHead {
+		objr, err = s.client.Bucket(attrs.Bucket).Object(attrs.Name).NewRangeReader(r.Context(), start, length)
+		if err != nil {
+			s.handleError(w, r, err)
+			return
+		}
+		defer objr.Close()
 	}
 
 	setTimeHeader(w, "Last-Modified", attrs.Updated)
@@ -518,12 +534,6 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 		return
 	}
 
-	objr, err := s.client.Bucket(attrs.Bucket).Object(attrs.Name).NewRangeReader(r.Context(), start, length)
-	if err != nil {
-		s.handleError(w, err)
-		return
-	}
-	defer objr.Close()
 	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 
 	w.WriteHeader(http.StatusPartialContent)
@@ -590,19 +600,19 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "OK\n")
 }
 
-func (s *Server) handleError(w http.ResponseWriter, err error) {
-	status := http.StatusInternalServerError
+func (s *Server) handleError(w http.ResponseWriter, r *http.Request, err error) {
+	status, level := http.StatusInternalServerError, slog.LevelError
 	if errors.Is(err, storage.ErrObjectNotExist) {
-		status = http.StatusNotFound
+		status, level = http.StatusNotFound, slog.LevelWarn
 	}
 	if s.logErrors {
-		slog.Error("proxy error", "status", status, "err", err)
+		slog.Log(r.Context(), level, "proxy error", "status", status, "url", r.URL.String(), "err", err)
 	}
+	msg := err.Error()
 	if s.redactErrors {
-		w.WriteHeader(status)
-		return
+		msg = http.StatusText(status)
 	}
-	http.Error(w, err.Error(), status)
+	http.Error(w, msg, status)
 }
 
 func header(r *http.Request, key string) (string, bool) {

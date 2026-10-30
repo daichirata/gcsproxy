@@ -791,7 +791,7 @@ func TestProxy_NotFound_MissingPageFallsBackToDefault404(t *testing.T) {
 
 // --- error redaction tests ---
 
-func TestProxy_RedactErrors_EmptyBodyOn404(t *testing.T) {
+func TestProxy_RedactErrors_GenericBodyOn404(t *testing.T) {
 	s := newTestServer(t, nil)
 	s.redactErrors = true
 
@@ -802,8 +802,66 @@ func TestProxy_RedactErrors_EmptyBodyOn404(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
-	if got := rec.Body.String(); got != "" {
-		t.Errorf("body should be empty with -redact-errors, got %q", got)
+	if got, want := rec.Body.String(), "Not Found\n"; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+}
+
+func TestProxy_ReaderErrorLeavesNoObjectHeaders(t *testing.T) {
+	// Attrs succeeded but the object is gone by the time its body is read:
+	// the error response must not carry the object's headers.
+	attrs := &storage.ObjectAttrs{
+		Bucket:             testBucket,
+		Name:               "deleted.png",
+		ContentType:        "image/png",
+		ContentLanguage:    "en",
+		CacheControl:       "public, max-age=3600",
+		ContentDisposition: "attachment",
+		Size:               100,
+		Updated:            time.Now(),
+	}
+	tests := []struct {
+		name  string
+		rng   string
+		serve func(s *Server, w http.ResponseWriter, r *http.Request)
+	}{
+		{"full", "", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
+				s.handleError(w, r, err)
+			}
+		}},
+		{"range", "bytes=0-9", func(s *Server, w http.ResponseWriter, r *http.Request) {
+			s.streamRange(w, r, attrs, r.Header.Get("Range"))
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestServer(t, nil)
+			s.redactErrors = true
+			s.contentLength = true
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/deleted.png", nil)
+			if tt.rng != "" {
+				req.Header.Set("Range", tt.rng)
+			}
+			tt.serve(s, rec, req)
+
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+			}
+			for _, h := range []string{"Accept-Ranges", "Cache-Control", "Content-Disposition", "Content-Language", "Content-Length", "Content-Range", "Last-Modified"} {
+				if got := rec.Header().Get(h); got != "" {
+					t.Errorf("%s = %q, want empty", h, got)
+				}
+			}
+			if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+				t.Errorf("Content-Type = %q, want text/plain", got)
+			}
+			if got, want := rec.Body.String(), "Not Found\n"; got != want {
+				t.Errorf("body = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -868,14 +926,38 @@ func TestProxy_ErrorIsLogged(t *testing.T) {
 	if got := entry["msg"]; got != "proxy error" {
 		t.Errorf("msg = %v, want %q", got, "proxy error")
 	}
-	if got := entry["level"]; got != "ERROR" {
-		t.Errorf("level = %v, want %q", got, "ERROR")
+	if got := entry["level"]; got != "WARN" {
+		t.Errorf("level = %v, want %q", got, "WARN")
 	}
 	if got := entry["status"]; got != float64(http.StatusNotFound) { // json numbers are float64
 		t.Errorf("status = %v, want %d", got, http.StatusNotFound)
 	}
 	if got, ok := entry["err"].(string); !ok || !strings.Contains(got, storage.ErrObjectNotExist.Error()) {
 		t.Errorf("err = %v, want to contain %q", entry["err"], storage.ErrObjectNotExist.Error())
+	}
+}
+
+func TestHandleError_ServerErrorLoggedAtErrorLevel(t *testing.T) {
+	s := &Server{logErrors: true}
+
+	var buf bytes.Buffer
+	installLogger(t, slog.NewJSONHandler(&buf, nil))
+
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/obj.txt", nil)
+	s.handleError(httptest.NewRecorder(), req, errors.New("boom"))
+
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &entry); err != nil {
+		t.Fatalf("log output is not valid JSON: %v\nraw: %s", err, buf.String())
+	}
+	if got := entry["level"]; got != "ERROR" {
+		t.Errorf("level = %v, want %q", got, "ERROR")
+	}
+	if got := entry["status"]; got != float64(http.StatusInternalServerError) {
+		t.Errorf("status = %v, want %d", got, http.StatusInternalServerError)
+	}
+	if got, want := entry["url"], "/"+testBucket+"/obj.txt"; got != want {
+		t.Errorf("url = %v, want %q", got, want)
 	}
 }
 
