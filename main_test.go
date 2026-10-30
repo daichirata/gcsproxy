@@ -898,15 +898,13 @@ func TestProxy_RedactErrors_CORSHeaderStillSet(t *testing.T) {
 	}
 }
 
-func TestProxy_ErrorIsLogged(t *testing.T) {
-	// With -log-errors, the full error detail is logged even when the
-	// response body is redacted.
+func TestProxy_NotFoundLoggedAtDebugLevel(t *testing.T) {
+	// The full error detail is logged even when the response body is redacted.
 	s := newTestServer(t, nil)
 	s.redactErrors = true
-	s.logErrors = true
 
 	var buf bytes.Buffer
-	installLogger(t, slog.NewJSONHandler(&buf, nil))
+	installLogger(t, slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
@@ -926,8 +924,8 @@ func TestProxy_ErrorIsLogged(t *testing.T) {
 	if got := entry["msg"]; got != "proxy error" {
 		t.Errorf("msg = %v, want %q", got, "proxy error")
 	}
-	if got := entry["level"]; got != "WARN" {
-		t.Errorf("level = %v, want %q", got, "WARN")
+	if got := entry["level"]; got != "DEBUG" {
+		t.Errorf("level = %v, want %q", got, "DEBUG")
 	}
 	if got := entry["status"]; got != float64(http.StatusNotFound) { // json numbers are float64
 		t.Errorf("status = %v, want %d", got, http.StatusNotFound)
@@ -938,7 +936,7 @@ func TestProxy_ErrorIsLogged(t *testing.T) {
 }
 
 func TestHandleError_ServerErrorLoggedAtErrorLevel(t *testing.T) {
-	s := &Server{logErrors: true}
+	s := &Server{}
 
 	var buf bytes.Buffer
 	installLogger(t, slog.NewJSONHandler(&buf, nil))
@@ -961,9 +959,8 @@ func TestHandleError_ServerErrorLoggedAtErrorLevel(t *testing.T) {
 	}
 }
 
-func TestProxy_ErrorNotLoggedWithoutFlag(t *testing.T) {
+func TestProxy_NotFoundNotLoggedAtInfoLevel(t *testing.T) {
 	s := newTestServer(t, nil)
-	// s.logErrors left as false (zero value)
 
 	var buf bytes.Buffer
 	installLogger(t, slog.NewJSONHandler(&buf, nil))
@@ -976,7 +973,7 @@ func TestProxy_ErrorNotLoggedWithoutFlag(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 	if got := strings.TrimSpace(buf.String()); got != "" {
-		t.Errorf("unexpected log output without -log-errors: %q", got)
+		t.Errorf("unexpected log output at info level: %q", got)
 	}
 }
 

@@ -36,7 +36,6 @@ type Server struct {
 	contentLength   bool
 	corsOrigin      string
 	redactErrors    bool
-	logErrors       bool
 	verbose         bool
 	shutdownDelay   time.Duration
 	idleGracePeriod time.Duration
@@ -61,8 +60,7 @@ func main() {
 		shutdownDelay   = flag.Duration("shutdown-delay", 0, "Delay after SIGTERM/SIGINT during which requests are served normally but responses carry Connection: close.")
 		idleGracePeriod = flag.Duration("shutdown-idle-grace-period", 0, "After the listener closes, keep idle connections open for up to this long; ends early once no connections remain.")
 		shutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "Max wait for in-flight requests after the idle grace period; 0 waits indefinitely.")
-		redactErrors    = flag.Bool("redact-errors", false, "Replace error response bodies with the generic HTTP status text.")
-		logErrors       = flag.Bool("log-errors", false, "Log proxy error details (404 at warn, others at error).")
+		redactErrors    = flag.Bool("redact-errors", true, "Replace error response bodies with the generic HTTP status text.")
 	)
 	flag.Parse()
 
@@ -123,7 +121,6 @@ func main() {
 		contentLength:   *contentLength,
 		corsOrigin:      *corsOrigin,
 		redactErrors:    *redactErrors,
-		logErrors:       *logErrors,
 		verbose:         *verbose,
 		shutdownDelay:   *shutdownDelay,
 		idleGracePeriod: *idleGracePeriod,
@@ -603,11 +600,9 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	status, level := http.StatusInternalServerError, slog.LevelError
 	if errors.Is(err, storage.ErrObjectNotExist) {
-		status, level = http.StatusNotFound, slog.LevelWarn
+		status, level = http.StatusNotFound, slog.LevelDebug
 	}
-	if s.logErrors {
-		slog.Log(r.Context(), level, "proxy error", "status", status, "url", r.URL.String(), "err", err)
-	}
+	slog.Log(r.Context(), level, "proxy error", "status", status, "url", r.URL.String(), "err", err)
 	msg := err.Error()
 	if s.redactErrors {
 		msg = http.StatusText(status)
