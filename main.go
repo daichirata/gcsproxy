@@ -7,11 +7,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/auth/credentials"
@@ -21,16 +26,20 @@ import (
 )
 
 type Server struct {
-	addr          string
-	client        *storage.Client
-	defaultIndex  string
-	walkUpIndex   bool
-	sourceBucket  string
-	spa           bool
-	notFoundPath  string
-	contentLength bool
-	corsOrigin    string
-	verbose       bool
+	addr            string
+	client          *storage.Client
+	defaultIndex    string
+	walkUpIndex     bool
+	sourceBucket    string
+	spa             bool
+	notFoundPath    string
+	contentLength   bool
+	corsOrigin      string
+	verbose         bool
+	shutdownDelay   time.Duration
+	idleGracePeriod time.Duration
+	shutdownTimeout time.Duration
+	draining        atomic.Bool
 }
 
 func main() {
@@ -47,6 +56,9 @@ func main() {
 		logLevel        = flag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 		contentLength   = flag.Bool("content-length", false, "Send the Content-Length header (disables chunked transfer).")
 		corsOrigin      = flag.String("cors-origin", "", "Value for the Access-Control-Allow-Origin header.")
+		shutdownDelay   = flag.Duration("shutdown-delay", 0, "Delay after SIGTERM/SIGINT during which requests are served normally but responses carry Connection: close.")
+		idleGracePeriod = flag.Duration("shutdown-idle-grace-period", 0, "After the listener closes, keep idle connections open for up to this long; ends early once no connections remain.")
+		shutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "Max wait for in-flight requests after the idle grace period; 0 waits indefinitely.")
 	)
 	flag.Parse()
 
@@ -74,6 +86,9 @@ func main() {
 	if *spa && *notFoundPath != "" {
 		fatal("-spa and -not-found are mutually exclusive")
 	}
+	if *shutdownDelay < 0 || *idleGracePeriod < 0 || *shutdownTimeout < 0 {
+		fatal("-shutdown-delay, -shutdown-idle-grace-period and -shutdown-timeout must not be negative")
+	}
 
 	ctx := context.Background()
 	var opts []option.ClientOption
@@ -91,28 +106,158 @@ func main() {
 	if err != nil {
 		fatal("failed to create client", "err", err)
 	}
+	defer client.Close()
 
 	s := &Server{
-		addr:          *bind,
-		client:        client,
-		defaultIndex:  *defaultIndex,
-		walkUpIndex:   *walkUpIndex,
-		sourceBucket:  *sourceBucket,
-		spa:           *spa,
-		notFoundPath:  *notFoundPath,
-		contentLength: *contentLength,
-		corsOrigin:    *corsOrigin,
-		verbose:       *verbose,
+		addr:            *bind,
+		client:          client,
+		defaultIndex:    *defaultIndex,
+		walkUpIndex:     *walkUpIndex,
+		sourceBucket:    *sourceBucket,
+		spa:             *spa,
+		notFoundPath:    *notFoundPath,
+		contentLength:   *contentLength,
+		corsOrigin:      *corsOrigin,
+		verbose:         *verbose,
+		shutdownDelay:   *shutdownDelay,
+		idleGracePeriod: *idleGracePeriod,
+		shutdownTimeout: *shutdownTimeout,
 	}
 
-	if err := s.ListenAndServe(); err != nil {
+	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// Unregister after the first signal so a second SIGTERM/SIGINT kills the
+	// process immediately via the default disposition.
+	context.AfterFunc(sigCtx, stop)
+
+	if err := s.ListenAndServe(sigCtx); err != nil {
 		fatal("server exited", "err", err)
 	}
 }
 
-func (s *Server) ListenAndServe() error {
-	slog.Info("listening", "addr", s.addr)
-	return http.ListenAndServe(s.addr, s.handler())
+func (s *Server) ListenAndServe(ctx context.Context) error {
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
+	}
+	slog.Info("listening", "addr", ln.Addr().String())
+	return s.serve(ctx, ln, s.handler())
+}
+
+// serve runs h on ln until ctx is canceled, then executes the phased graceful
+// shutdown: drain (Connection: close) -> close listener -> idle grace ->
+// Shutdown. Idle connections stay open until the idle grace period elapses so
+// clients never race a new request against a server-side close.
+func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) error {
+	tracker := &connTracker{}
+	srv := &http.Server{Handler: s.drainingHandler(h), ConnState: tracker.connState}
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+
+	// Phase 1: keep serving; every new response tells clients to stop reusing.
+	s.draining.Store(true)
+	slog.Info("shutdown: draining", "delay", s.shutdownDelay)
+	time.Sleep(s.shutdownDelay)
+
+	// Phase 2: stop accepting new connections. Existing conns keep working.
+	slog.Info("shutdown: closing listener")
+	ln.Close()
+	// Wait for Serve to return so it untracks its listener; otherwise Shutdown
+	// below can report a spurious double-close error.
+	if err := <-errc; err != nil && !errors.Is(err, net.ErrClosed) {
+		slog.Warn("shutdown: serve loop exited with error", "err", err)
+	}
+
+	// Phase 3: leave idle connections open; requests on them are still served.
+	// Skip the wait when no connections remain, and end it early once the
+	// last one closes.
+	slog.Info("shutdown: waiting before closing idle connections", "grace", s.idleGracePeriod, "open", tracker.open())
+	select {
+	case <-tracker.noneOpen():
+		slog.Info("shutdown: no connections remain")
+	case <-time.After(s.idleGracePeriod):
+	}
+
+	// Phase 4: close idle connections, wait for in-flight requests.
+	slog.Info("shutdown: closing idle connections", "timeout", s.shutdownTimeout)
+	sctx := context.Background()
+	if s.shutdownTimeout > 0 {
+		var cancel context.CancelFunc
+		sctx, cancel = context.WithTimeout(sctx, s.shutdownTimeout)
+		defer cancel()
+	}
+	if err := srv.Shutdown(sctx); err != nil {
+		srv.Close()
+		return fmt.Errorf("graceful shutdown incomplete: %w", err)
+	}
+	slog.Info("shutdown: complete")
+	return nil
+}
+
+// connTracker counts open server connections via http.Server.ConnState so
+// the shutdown sequence can stop waiting as soon as none remain. Active
+// connections count too: a response whose headers predate the drain flag
+// carries no Connection: close, so its connection can still go idle and be
+// reused by the client.
+type connTracker struct {
+	mu     sync.Mutex
+	count  int
+	waiter chan struct{}
+}
+
+func (ct *connTracker) connState(_ net.Conn, state http.ConnState) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	switch state {
+	case http.StateNew:
+		ct.count++
+	case http.StateHijacked, http.StateClosed:
+		ct.count--
+		if ct.count == 0 && ct.waiter != nil {
+			close(ct.waiter)
+			ct.waiter = nil
+		}
+	}
+}
+
+func (ct *connTracker) open() int {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	return ct.count
+}
+
+// noneOpen returns a channel that is closed once no connections remain open.
+// Only valid after the listener stopped accepting new connections, since the
+// count never rises again from zero.
+func (ct *connTracker) noneOpen() <-chan struct{} {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	ch := make(chan struct{})
+	if ct.count == 0 {
+		close(ch)
+	} else {
+		ct.waiter = ch
+	}
+	return ch
+}
+
+// drainingHandler marks every response written after shutdown begins with
+// Connection: close, so keep-alive clients stop reusing the connection.
+// net/http then closes the connection after the response completes.
+func (s *Server) drainingHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.draining.Load() {
+			w.Header().Set("Connection", "close")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handler() http.Handler {

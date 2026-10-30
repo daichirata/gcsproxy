@@ -48,6 +48,7 @@ curl http://localhost:8080/<your-bucket>/<your-object>
 - Optional `Access-Control-Allow-Origin` header (`-cors-origin`) for simple CORS use cases
 - Structured logging via `log/slog` with text or JSON output (`-log-format`)
 - `/_health` endpoint for liveness/readiness probes
+- Graceful shutdown on SIGTERM/SIGINT with configurable drain windows (`-shutdown-delay`, `-shutdown-idle-grace-period`, `-shutdown-timeout`) for zero-downtime deploys
 
 ## Installation
 
@@ -93,6 +94,12 @@ Usage of gcsproxy:
         Minimum log level: debug, info, warn, or error. (default "info")
   -not-found string
         Object served with HTTP 404 for unmatched routes.
+  -shutdown-delay duration
+        Delay after SIGTERM/SIGINT during which requests are served normally but responses carry Connection: close.
+  -shutdown-idle-grace-period duration
+        After the listener closes, keep idle connections open for up to this long; ends early once no connections remain.
+  -shutdown-timeout duration
+        Max wait for in-flight requests after the idle grace period; 0 waits indefinitely. (default 30s)
   -spa
         SPA fallback: serve -i from the bucket root with HTTP 200 for unmatched routes.
   -v    Show access log.
@@ -232,7 +239,30 @@ Edge cases:
 
 ### Health check
 
-`/_health` returns `200 OK` with the body `OK`. It does not call GCS and is safe to use as a Kubernetes/Cloud Run liveness or readiness probe.
+`/_health` returns `200 OK` with the body `OK`. It does not call GCS and is safe to use as a Kubernetes/Cloud Run liveness or readiness probe. It keeps returning `200` during graceful shutdown, so a liveness probe won't kill the process mid-drain.
+
+### Graceful shutdown
+
+On SIGTERM or SIGINT, gcsproxy shuts down in four phases designed to eliminate 502/503s and connection resets during rolling deploys:
+
+1. **Drain** (`-shutdown-delay`): nothing stops — new connections are accepted and requests are served normally, but every response carries `Connection: close`, telling keep-alive clients (e.g. an nginx `upstream keepalive` pool) to retire the connection after use.
+2. **Stop accepting**: the listener closes; new TCP connections are refused. Existing connections keep working.
+3. **Idle grace** (`-shutdown-idle-grace-period`): existing idle connections stay open, because a client may send a request at the exact moment the server would close one (that race is what causes resets). Requests arriving on them are still served, each response again marked `Connection: close`. This phase ends as soon as no connections remain open, so it never waits longer than necessary.
+4. **Close** (`-shutdown-timeout`): remaining idle connections are closed and gcsproxy waits for in-flight requests to finish — at most `-shutdown-timeout` (default `30s`; `0` waits indefinitely) — then exits 0.
+
+`-shutdown-delay` and `-shutdown-idle-grace-period` default to `0s`, which still gives a basic graceful shutdown (in-flight requests complete before exit). Recommended production values:
+
+```
+gcsproxy -shutdown-delay 5s -shutdown-idle-grace-period 5s -shutdown-timeout 30s
+```
+
+Sizing guidance:
+
+- Set `-shutdown-idle-grace-period` above your clients' idle-connection reuse timeout (nginx upstream `keepalive_timeout`, Go's `Transport.IdleConnTimeout`, etc.) so every pooled connection is either used once more (and cleanly closed) or closed by the client before the server closes it.
+- Make sure your supervisor's kill timeout (systemd `TimeoutStopSec`, Kubernetes `terminationGracePeriodSeconds`) exceeds `shutdown-delay + shutdown-idle-grace-period + shutdown-timeout`, otherwise the process is SIGKILLed mid-drain.
+- A second SIGTERM/SIGINT terminates the process immediately.
+
+Note that even with the default values, SIGTERM now waits for in-flight requests (up to `-shutdown-timeout`) instead of exiting immediately; supervisors backstop this with SIGKILL after their kill timeout.
 
 ### Authentication
 
@@ -275,8 +305,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/gcsproxy/gcsproxy -v
+ExecStart=/opt/gcsproxy/gcsproxy -v -shutdown-delay 5s -shutdown-idle-grace-period 5s -shutdown-timeout 30s
 Restart=on-failure
+# Must exceed shutdown-delay + shutdown-idle-grace-period + shutdown-timeout.
+TimeoutStopSec=45
 
 [Install]
 WantedBy=multi-user.target
