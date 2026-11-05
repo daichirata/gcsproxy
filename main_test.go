@@ -55,10 +55,18 @@ const (
 	opRead
 )
 
-// gcsCalls counts the requests per operation that reached the fake.
+// gcsCalls counts the requests per operation that reached the fake, and
+// records the generation each read asked for.
 type gcsCalls struct {
-	mu sync.Mutex
-	n  map[gcsOp]int
+	mu       sync.Mutex
+	n        map[gcsOp]int
+	readGens []string
+}
+
+func (c *gcsCalls) readGenerations() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.readGens)
 }
 
 func (c *gcsCalls) get(op gcsOp) int {
@@ -91,6 +99,9 @@ func newFaultyServer(t *testing.T, objects []fakestorage.Object, fault func(op g
 		}
 		calls.mu.Lock()
 		calls.n[op]++
+		if op == opRead {
+			calls.readGens = append(calls.readGens, r.URL.Query().Get("generation"))
+		}
 		n := calls.n[op]
 		calls.mu.Unlock()
 		if fault != nil {
@@ -98,7 +109,7 @@ func newFaultyServer(t *testing.T, objects []fakestorage.Object, fault func(op g
 				return &http.Response{
 					StatusCode: status,
 					Header:     http.Header{"Content-Type": {"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":` + http.StatusText(status) + `}}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":` + strconv.Itoa(status) + `,"message":"` + http.StatusText(status) + `"}}`)),
 					Request:    r,
 				}, nil
 			}
@@ -1112,7 +1123,7 @@ func TestProxy_ErrorResponses(t *testing.T) {
 				t.Errorf("body = %q, want %q", rec.Body.String(), tc.wantBody)
 			}
 			// A failed read must not leak the object's headers onto the error.
-			for _, k := range []string{"Accept-Ranges", "Cache-Control", "Content-Range", "ETag", "Last-Modified"} {
+			for _, k := range []string{"Accept-Ranges", "Cache-Control", "Content-Length", "Content-Range", "ETag", "Last-Modified"} {
 				if got := rec.Header().Get(k); got != "" {
 					t.Errorf("%s = %q, want empty", k, got)
 				}
@@ -1127,6 +1138,26 @@ func TestProxy_ErrorResponses(t *testing.T) {
 // TestProxy_GenerationChangedRetry simulates an overwrite between the attrs
 // lookup and the generation-pinned read: the request is re-evaluated once
 // against fresh attrs, and answers 503 if the generation changes again.
+func TestProxy_ReadsPinnedToValidatedGeneration(t *testing.T) {
+	obj := testFile()
+	obj.Generation = 1234
+	for _, rng := range []string{"", "bytes=2-5"} {
+		t.Run("range="+rng, func(t *testing.T) {
+			s, calls := newFaultyServer(t, []fakestorage.Object{obj}, nil)
+			var h http.Header
+			if rng != "" {
+				h = hdr("Range", rng)
+			}
+			if rec := do(t, s, http.MethodGet, filePath, h); rec.Code >= 300 {
+				t.Fatalf("status = %d, want success", rec.Code)
+			}
+			if got := calls.readGenerations(); !slices.Equal(got, []string{"1234"}) {
+				t.Errorf("read generations = %q, want [1234]", got)
+			}
+		})
+	}
+}
+
 func TestProxy_GenerationChangedRetry(t *testing.T) {
 	cases := []struct {
 		name      string
