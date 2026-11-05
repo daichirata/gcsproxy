@@ -307,11 +307,11 @@ func (s *Server) wrap(fn http.HandlerFunc) http.HandlerFunc {
 			status:         http.StatusOK,
 		}
 		fn(writer, r)
-		addr := r.RemoteAddr
-		if ip, found := header(r, "X-Forwarded-For"); found {
-			addr = ip
-		}
 		if s.verbose {
+			addr := r.RemoteAddr
+			if ip, found := header(r, "X-Forwarded-For"); found {
+				addr = ip
+			}
 			slog.Info("access",
 				"remote", addr,
 				"elapsed", time.Since(proc).Seconds(),
@@ -354,7 +354,7 @@ func (s *Server) proxyOnce(w http.ResponseWriter, r *http.Request, bucket, objec
 		}
 		return err
 	}
-	if s.checkPreconditions(w, r, attrs) {
+	if checkPreconditions(w, r, attrs) {
 		return nil
 	}
 
@@ -442,7 +442,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, obj
 	}
 	// Preconditions apply only to would-be-2xx responses (RFC 9110 §13.2.1):
 	// the SPA fallback revalidates, the -not-found 404 page never does.
-	if status == http.StatusOK && s.checkPreconditions(w, r, attrs) {
+	if status == http.StatusOK && checkPreconditions(w, r, attrs) {
 		return nil
 	}
 	return s.streamObject(w, r, attrs, status)
@@ -751,7 +751,7 @@ func writeNotModified(w http.ResponseWriter, attrs *storage.ObjectAttrs) {
 // checkPreconditions follows the evaluation order of RFC 9110 §13.2.2 and
 // reports whether it has written a 412 or 304. Invalid HTTP-dates and unknown
 // (zero) modification times disable the date-based checks.
-func (s *Server) checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs) bool {
+func checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs) bool {
 	if ifMatch := r.Header.Values("If-Match"); hasETagValues(ifMatch) {
 		if !anyETagMatches(ifMatch, objectETag(attrs), true) {
 			http.Error(w, "Precondition Failed", http.StatusPreconditionFailed)
@@ -760,9 +760,7 @@ func (s *Server) checkPreconditions(w http.ResponseWriter, r *http.Request, attr
 	} else if ius, ok := header(r, "If-Unmodified-Since"); ok && !attrs.Updated.IsZero() {
 		t, err := http.ParseTime(ius)
 		if err != nil {
-			if s.verbose {
-				slog.Warn("could not parse If-Unmodified-Since", "err", err)
-			}
+			slog.DebugContext(r.Context(), "ignoring invalid If-Unmodified-Since", "err", err)
 		} else if attrs.Updated.Truncate(time.Second).After(t) {
 			http.Error(w, "Precondition Failed", http.StatusPreconditionFailed)
 			return true
@@ -782,9 +780,7 @@ func (s *Server) checkPreconditions(w http.ResponseWriter, r *http.Request, attr
 	if ims, ok := header(r, "If-Modified-Since"); ok && !attrs.Updated.IsZero() {
 		t, err := http.ParseTime(ims)
 		if err != nil {
-			if s.verbose {
-				slog.Warn("could not parse If-Modified-Since", "err", err)
-			}
+			slog.DebugContext(r.Context(), "ignoring invalid If-Modified-Since", "err", err)
 			return false
 		}
 		if !attrs.Updated.Truncate(time.Second).After(t) {

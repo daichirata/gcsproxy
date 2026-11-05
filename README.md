@@ -5,21 +5,30 @@
 [![Go](https://img.shields.io/github/go-mod/go-version/daichirata/gcsproxy)](go.mod)
 [![License](https://img.shields.io/github/license/daichirata/gcsproxy)](LICENSE)
 
-A lightweight reverse proxy for Google Cloud Storage.
+**A lightweight reverse proxy for Google Cloud Storage.**
 
-gcsproxy lets you keep a GCS bucket private while still serving its objects over HTTP, so you can put your own access controls (IP allowlist, basic auth, IAP, etc.) in front of it. It authenticates to GCS using the host's credentials and streams object contents back to the client.
+Keep a bucket private and still serve its objects over HTTP. gcsproxy authenticates to GCS with the host's credentials and streams objects to the client, so you can put any access control you like — IP allowlists, basic auth, IAP — in front of it.
 
 ```
-+-----------------------------+         +------------+         +------------------+
-|           Nginx             |  HTTP   |            |  GCS    |                  |
-|  (auth / IP allow / TLS)    | ------> |  gcsproxy  | ------> |   Google Cloud   |
-|                             |         |            |   API   |     Storage      |
-+-----------------------------+         +------------+         +------------------+
+╭────────╮       ╭───────────────────╮      ╭──────────╮         ╭───────────────╮
+│ Client │ ────▶ │ nginx / LB / IAP  │ ───▶ │ gcsproxy │ ──────▶ │ Cloud Storage │
+╰────────╯ HTTPS ╰───────────────────╯ HTTP ╰──────────╯ GCS API ╰───────────────╯
+                  auth · IP allow · TLS                           private bucket
 ```
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Features](#features)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Serving](#serving) — routing, index files, SPA, not-found pages, caching, ranges, CORS
+- [Operations](#operations) — authentication, health checks, graceful shutdown, h2c, logging
+- [Examples](#examples) — Docker, Compose, systemd, nginx
 
 ## Quick start
 
-Run gcsproxy locally with your existing [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) (set up via `gcloud auth application-default login`):
+Run gcsproxy with your local [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) (`gcloud auth application-default login`):
 
 ```bash
 docker run --rm -p 8080:80 \
@@ -28,7 +37,7 @@ docker run --rm -p 8080:80 \
     ghcr.io/daichirata/gcsproxy:latest -b 0.0.0.0:80
 ```
 
-Then fetch a private object through the proxy:
+Then fetch a private object through it:
 
 ```bash
 curl http://localhost:8080/<your-bucket>/<your-object>
@@ -36,39 +45,44 @@ curl http://localhost:8080/<your-bucket>/<your-object>
 
 ## Features
 
-- Streams GCS objects directly to clients (no temporary files on disk)
-- Forwards `Content-Type`, `Content-Language`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Last-Modified` (and `Content-Length` with `-content-length`)
-- Emits `ETag` and honors conditional requests — `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since`, `If-Range` — with `304 Not Modified` / `412 Precondition Failed` replies
-- Supports `Range` requests (single range) for partial downloads / video seeking, forwarded to GCS so only the requested bytes traverse the wire
-- Negotiates `Content-Encoding: gzip` when the client accepts it
-- Optional default index file (`-i`) for serving static sites
-- Optional fixed bucket (`-bucket`) for hosting a single bucket without exposing its name in URLs
-- Optional SPA fallback (`-spa`) that returns the index file with HTTP 200 for unmatched routes
-- Optional custom not-found page (`-not-found`) served with HTTP 404 for unmatched routes
-- Error responses hide GCS error details such as bucket and object names (`-redact-errors`, on by default)
-- Optional `Access-Control-Allow-Origin` header (`-cors-origin`) for simple CORS use cases
-- Structured logging via `log/slog` with text or JSON output (`-log-format`)
-- Optional cleartext HTTP/2 (h2c) support (`-h2c`) alongside HTTP/1.1
-- `/_health` endpoint for liveness/readiness probes
-- Graceful shutdown on SIGTERM/SIGINT with configurable drain windows (`-shutdown-delay`, `-shutdown-idle-grace-period`, `-shutdown-timeout`) for zero-downtime deploys
+**Serving**
+
+- Streams objects straight from GCS — no temporary files on disk
+- Forwards `Content-Type`, `Content-Language`, `Cache-Control`, `Content-Disposition`, `Content-Encoding` and `Last-Modified` (plus `Content-Length` with `-content-length`)
+- Negotiates `Content-Encoding: gzip` with the client
+- Optional fixed bucket (`-bucket`) that keeps the bucket name out of URLs
+- Optional `Access-Control-Allow-Origin` header (`-cors-origin`) for simple CORS
+
+**Caching and partial content**
+
+- `ETag` plus RFC 9110 conditional requests — `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since`, `If-Range` — answered with `304` / `412`
+- Single-range `Range` requests for video seeking and resumable downloads; only the requested bytes leave GCS
+
+**Static sites**
+
+- Default index file (`-i`), optionally walking up parent directories (`-walk-up-index`)
+- SPA fallback (`-spa`) that serves the index with `200` for client-side routes
+- Custom not-found page (`-not-found`) served with `404`
+
+**Operations**
+
+- Graceful shutdown with configurable drain windows for zero-downtime deploys
+- Optional cleartext HTTP/2 (`-h2c`) alongside HTTP/1.1
+- `/_health` endpoint for liveness and readiness probes
+- Structured logging via `log/slog`, as JSON or text
+- Error responses that hide bucket and object names by default (`-redact-errors`)
 
 ## Installation
 
-### Pre-built binaries
+**Pre-built binaries** — download the archive for your platform from the [Releases page](https://github.com/daichirata/gcsproxy/releases).
 
-Download the latest release for your platform from the [Releases page](https://github.com/daichirata/gcsproxy/releases).
-
-### Docker image
-
-Multi-arch images (`linux/amd64`, `linux/arm64`) are published to the GitHub Container Registry on every release:
+**Docker** — multi-arch images (`linux/amd64`, `linux/arm64`) are published to the GitHub Container Registry on every release ([all tags](https://github.com/daichirata/gcsproxy/pkgs/container/gcsproxy)):
 
 ```bash
 docker pull ghcr.io/daichirata/gcsproxy:latest
 ```
 
-See the [Packages page](https://github.com/daichirata/gcsproxy/pkgs/container/gcsproxy) for all available tags.
-
-### From source
+**From source**:
 
 ```bash
 go install github.com/daichirata/gcsproxy@latest
@@ -113,203 +127,173 @@ Usage of gcsproxy:
         When -i lookup misses, retry parent directories for index files before not-found handling.
 ```
 
+## Serving
+
 ### Routing
 
-By default, the bucket name is taken from the first path segment:
+By default the bucket name is taken from the first path segment:
 
 ```
 /{bucket}/{object}
+
+GET http://localhost:8080/test-bucket/path/to/file.txt
+  → gs://test-bucket/path/to/file.txt
 ```
 
-For example, with gcsproxy listening on `localhost:8080`, the GCS object `gs://test-bucket/path/to/file.txt` is served at `http://localhost:8080/test-bucket/path/to/file.txt`.
-
-When `-bucket <name>` is set, that bucket is used for every request and the bucket name is no longer parsed from the URL:
+With `-bucket <name>`, every request is served from that bucket and the whole path is the object name:
 
 ```
 /{object}
 ```
 
-This is useful when gcsproxy is fronting exactly one bucket (e.g. a private static site) and you don't want the bucket name to appear in the path. It also avoids issues with URL-rewriting load balancers and Identity-Aware Proxy, where the rewritten path would otherwise leak into post-auth redirects.
+Use this when gcsproxy fronts exactly one bucket, such as a private static site. It keeps the bucket name out of URLs and avoids URL-rewriting load balancers and Identity-Aware Proxy leaking the rewritten path into post-auth redirects.
 
 ### Default index file
 
-If `-i` is set, requests that don't resolve to an object will fall back to the configured index file:
+With `-i`, a request that doesn't resolve to an object falls back to the index file under that path:
 
 ```
 gcsproxy -i index.html
 
 GET /test-bucket/foo/bar
-  -> gs://test-bucket/foo/bar/index.html
+  → gs://test-bucket/foo/bar/index.html
 ```
 
-When `-walk-up-index` is also set, gcsproxy will retry parent directories while keeping the same bucket/object prefix:
+Add `-walk-up-index` to keep trying parent directories, staying within the same bucket:
 
 ```
 gcsproxy -i index.html -walk-up-index
 
 GET /test-bucket/prefix/site/search
-  -> try gs://test-bucket/prefix/site/search/index.html
-  -> try gs://test-bucket/prefix/site/index.html
+  → try gs://test-bucket/prefix/site/search/index.html
+  → try gs://test-bucket/prefix/site/index.html
+  → …
 ```
 
 ### SPA fallback
 
-When `-spa` is set together with `-i`, any request that fails to resolve — even after the `-i` lookup — serves the configured index file from the bucket root with HTTP 200. This is the standard pattern for client-side-routed apps (React, Vue, etc.):
+With `-spa` (requires `-i`), any request that still fails to resolve serves the index file from the bucket root with `200` — the standard setup for client-side-routed apps (React, Vue, …):
 
 ```
 gcsproxy -i index.html -spa
 
 GET /test-bucket/some/spa/route
-  -> gs://test-bucket/index.html  (HTTP 200)
+  → gs://test-bucket/index.html  (200)
 ```
 
-This mirrors [Cloudflare Workers'](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/) `not_found_handling = "single-page-application"` and [Netlify's](https://docs.netlify.com/manage/routing/redirects/rewrites-proxies/) `/* /index.html 200` rewrite. `-spa` requires `-i` to be set and is mutually exclusive with `-not-found`.
+This mirrors [Cloudflare Workers'](https://developers.cloudflare.com/workers/static-assets/routing/single-page-application/) `not_found_handling = "single-page-application"` and [Netlify's](https://docs.netlify.com/manage/routing/redirects/rewrites-proxies/) `/* /index.html 200` rewrite. `-spa` and `-not-found` are mutually exclusive.
 
 ### Custom not-found page
 
-When `-not-found <path>` is set, requests that fail to resolve serve the given object with HTTP 404 instead of the default plain-text 404. The object's `Content-Type` and other headers are forwarded as-is:
+With `-not-found <path>`, requests that fail to resolve serve that object with `404` instead of the plain-text default. The object's `Content-Type` and other headers are forwarded as-is:
 
 ```
 gcsproxy -not-found 404.html
 
 GET /test-bucket/missing
-  -> gs://test-bucket/404.html  (HTTP 404)
+  → gs://test-bucket/404.html  (404)
 ```
-
-### Error responses
-
-GCS error messages can reveal bucket and object names or details about the service account's permissions. By default, error responses carry only the generic status text, and the full error is written to the log instead (see [Logging](#logging)):
-
-```
-GET /test-bucket/missing
-  -> HTTP 404, body "Not Found"
-```
-
-Pass `-redact-errors=false` to return the GCS error message in the response body, e.g. while debugging locally.
-
-### Logging
-
-gcsproxy uses Go's standard `log/slog` package and writes structured logs to stderr. The default `json` format is ready to be ingested by Cloud Logging, Datadog, Loki, and similar aggregation pipelines:
-
-```json
-{"time":"2026-05-21T09:00:00Z","level":"INFO","msg":"access","remote":"127.0.0.1","elapsed":0.0042,"status":200,"method":"GET","url":"/bucket/foo/bar"}
-```
-
-Pass `-log-format text` for human-readable `key=value` output when running locally:
-
-```
-gcsproxy -log-format text -v
-```
-
-The access log line is only emitted when `-v` is set.
-
-`-log-level <debug|info|warn|error>` (default `info`) filters at the slog handler. Set it to `warn` to suppress the `INFO` startup and access logs while keeping `WARN`/`ERROR` visible:
-
-```
-gcsproxy -log-level warn
-```
-
-Failed requests are logged as `proxy error` with the status, URL, and full GCS error. Server errors are logged at `ERROR`; missing objects (404) and requests canceled by the client are logged at `DEBUG`, so pass `-log-level debug` to see them:
-
-```json
-{"time":"2026-05-21T09:00:00Z","level":"ERROR","msg":"proxy error","status":500,"url":"/bucket/foo/bar","err":"googleapi: Error 403: ..."}
-```
-
-### Transfer encoding
-
-By default gcsproxy does not emit the `Content-Length` header. `net/http` then uses `Transfer-Encoding: chunked` for any response large enough to matter, which bypasses the [32 MiB non-streamed response cap](https://cloud.google.com/run/quotas) enforced by platforms like Cloud Run.
-
-Small responses may still get an auto-populated `Content-Length` from `net/http`, but that is harmless because they are well below any platform limit.
-
-Pass `-content-length` to emit the header for every response — useful when clients need to know the total size up front for progress indicators. The 32 MiB Cloud Run cap will then apply.
-
-### CORS
-
-Pass `-cors-origin <value>` to add an `Access-Control-Allow-Origin` header to every response (success and error alike):
-
-```
-gcsproxy -cors-origin '*'
-gcsproxy -cors-origin 'https://example.com'
-```
-
-This is sufficient for [simple cross-origin requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS#simple_requests) — `<img>`, `<link>`, `<video>`, plain `fetch(url)`, etc. — which is what most static-site hosting needs.
-
-Requests that require a preflight (custom headers, credentialed `fetch`, non-`GET/HEAD/POST` methods) are not supported; front gcsproxy with a proxy like nginx if you need that.
 
 ### Conditional requests
 
-gcsproxy emits the object's [GCS etag](https://cloud.google.com/storage/docs/hashes-etags) as the `ETag` header — it changes whenever the object's content or metadata is rewritten — and evaluates the standard [RFC 9110 preconditions](https://httpwg.org/specs/rfc9110.html#preconditions) against it and `Last-Modified`:
+gcsproxy emits the object's [GCS etag](https://cloud.google.com/storage/docs/hashes-etags) as `ETag` and evaluates the [RFC 9110 preconditions](https://httpwg.org/specs/rfc9110.html#preconditions) against it and `Last-Modified`:
 
 ```
 GET /test-bucket/app.js
 
 → 200 OK
-   ETag: "CJqzl4Ol0PACEAE="
-   Last-Modified: Wed, 04 Mar 2026 05:06:07 GMT
+  ETag: "CJqzl4Ol0PACEAE="
+  Last-Modified: Wed, 04 Mar 2026 05:06:07 GMT
 
 GET /test-bucket/app.js
 If-None-Match: "CJqzl4Ol0PACEAE="
 
 → 304 Not Modified
-   ETag: "CJqzl4Ol0PACEAE="
-   Last-Modified: Wed, 04 Mar 2026 05:06:07 GMT
-   Cache-Control: <the object's Cache-Control, if any>
+  ETag: "CJqzl4Ol0PACEAE="
+  Last-Modified: Wed, 04 Mar 2026 05:06:07 GMT
+  Cache-Control: <the object's Cache-Control, if any>
 ```
 
-Supported preconditions:
+| Header | Comparison | When it fails |
+|---|---|---|
+| `If-None-Match` | weak; lists and `*` | `304 Not Modified` on match. Overrides `If-Modified-Since`. |
+| `If-Modified-Since` | second granularity | `304 Not Modified` if not modified since. |
+| `If-Match` | strong; lists and `*` | `412 Precondition Failed` on no match. |
+| `If-Unmodified-Since` | second granularity | `412 Precondition Failed` if modified since. Ignored when `If-Match` is present. |
+| `If-Range` | strong etag or exact date | Full `200` instead of `206` — see [Range requests](#range-requests). |
 
-- `If-None-Match` (weak comparison, entity-tag lists, `*`) → `304 Not Modified` on match. When present, `If-Modified-Since` is ignored, as RFC 9110 requires.
-- `If-Modified-Since` → `304 Not Modified` when the object has not been modified after the given date.
-- `If-Match` (strong comparison, entity-tag lists, `*`) and `If-Unmodified-Since` → `412 Precondition Failed` when they do not hold. `If-Unmodified-Since` is ignored when `If-Match` is present.
-- `If-Range` — see [Range requests](#range-requests) below.
+Things worth knowing:
 
-Details:
-
-- `If-None-Match` uses weak comparison, so intermediaries that weaken the etag survive revalidation: a CDN or cache (nginx gzip filter, Varnish, ...) that recompresses the response downgrades `"abc"` to `W/"abc"`, and a later `If-None-Match: W/"abc"` still produces a `304` from gcsproxy.
-- Preconditions are evaluated before `Range` processing: a range request whose `If-None-Match` matches answers `304` (not `206`), and a failing `If-Match` answers `412`.
-- Date conditionals accept all three HTTP-date formats (IMF-fixdate, RFC 850, asctime) and are compared at the second granularity of `Last-Modified`; invalid dates are ignored per RFC 9110. Malformed entity-tags never match, and a present-but-empty `If-Match`/`If-None-Match` is treated as absent, matching `net/http` semantics.
-- Objects stored with `Content-Encoding: gzip` get a **weak** etag (`W/"…"`) plus `Vary: Accept-Encoding`, because the same URL serves either the raw gzip bytes or the GCS-transcoded body depending on the request's `Accept-Encoding` — two representations that a strong etag must not conflate.
-- Directory requests resolved through the default index file (`-i`, including `-walk-up-index`) and the SPA fallback (`-spa`) revalidate against the *resolved* index object's etag, so clients can cache the app shell. The custom not-found page (`-not-found`) is served with `404` and is never subject to preconditions.
-- Reads are pinned to the generation the validators were derived from, so a concurrent overwrite cannot pair a new body with a stale `ETag`/`Last-Modified`. If that generation is already gone (overwritten in a bucket without object versioning), the request is re-evaluated once against the new generation — preconditions, `If-Range` and `Range` included — and answers `503` if it changes again.
+- **The etag tracks the GCS generation, not the bytes.** Re-uploading identical content, or changing the object's metadata, produces a new `ETag`.
+- **Weak `If-None-Match` comparison** lets revalidation survive intermediaries that weaken the tag: a cache that recompresses the body (nginx gzip filter, Varnish, …) turns `"abc"` into `W/"abc"`, and `If-None-Match: W/"abc"` still gets a `304`.
+- **Preconditions run before `Range`**, so a matching `If-None-Match` answers `304` rather than `206`, and a failing `If-Match` answers `412`.
+- **gzip-stored objects get a weak etag** (`W/"…"`) and `Vary: Accept-Encoding`: the same URL serves either the raw gzip bytes or the GCS-transcoded body depending on `Accept-Encoding`.
+- **Index, walk-up and SPA responses** revalidate against the resolved index object, so clients can cache the app shell. The `-not-found` page is never conditional.
+- **Invalid input is ignored, as in `net/http`**: unparsable dates, malformed entity-tags and empty `If-Match`/`If-None-Match` fields don't affect the response. All three HTTP-date formats are accepted.
+- **Reads are pinned to the validated generation**, so a concurrent overwrite can never pair a new body with stale validators. If that generation disappears mid-request, the request is re-evaluated once against the new one — preconditions and range included — and answers `503` if it changes again.
 
 ### Range requests
 
-gcsproxy advertises `Accept-Ranges: bytes` on full responses (except for `Content-Encoding: gzip` objects, see below) and serves a single byte range when the client sends a `Range` header:
+Full responses advertise `Accept-Ranges: bytes`, and a single byte range is served when the client asks for one:
 
 ```
 GET /test-bucket/video.mp4
 Range: bytes=1048576-2097151
 
 → 206 Partial Content
-   Content-Range: bytes 1048576-2097151/<total>
-   Content-Length: 1048576
+  Content-Range: bytes 1048576-2097151/<total>
+  Content-Length: 1048576
 ```
 
-The range is forwarded to GCS via [`NewRangeReader`](https://pkg.go.dev/cloud.google.com/go/storage#ObjectHandle.NewRangeReader), so only the requested bytes are transferred from GCS — useful for video seeking, resumable downloads, and large-file streaming.
+The range is forwarded to GCS via [`NewRangeReader`](https://pkg.go.dev/cloud.google.com/go/storage#ObjectHandle.NewRangeReader), so only the requested bytes are transferred — ideal for video seeking, resumable downloads and large files.
 
-Supported forms: `bytes=N-M`, `bytes=N-`, and `bytes=-N`. Multi-range requests (`bytes=0-99,200-299`) are reduced to their first range; `multipart/byteranges` responses are not implemented.
+Supported forms are `bytes=N-M`, `bytes=N-` and `bytes=-N`. Multi-range requests (`bytes=0-99,200-299`) are reduced to their first range; `multipart/byteranges` is not implemented.
 
-Edge cases:
+| Request | Response |
+|---|---|
+| In-bounds range | `206` with `Content-Range` |
+| Out-of-bounds range, or last byte before first (`bytes=500-100`) | `416` with `Content-Range: bytes */<size>` |
+| Non-`bytes` unit or unparsable range ([RFC 9110 §14.2](https://httpwg.org/specs/rfc9110.html#field.range)) | Range ignored, full `200` |
+| `If-Range` doesn't match (weak tags never do) | Range ignored, full `200` — a resumed download never mixes two versions |
+| Object stored with `Content-Encoding: gzip` | Full `200` — GCS transcodes these, so offsets would be ambiguous |
 
-- Range headers with a non-`bytes` unit are ignored and the request is served as a normal `200`, per [RFC 9110 §14.2](https://httpwg.org/specs/rfc9110.html#field.range). The same ignore-and-fall-through applies to byte-ranges that fail to parse as integers.
-- Byte-ranges that fall outside the object — or whose last byte precedes the first (e.g. `bytes=500-100`) — return `416` with a `Content-Range: bytes */<size>` header.
-- `If-Range` is honored: a strong entity-tag must match the current `ETag` (weak `W/"…"` tags never match), or an HTTP-date must exactly equal `Last-Modified`; otherwise the `Range` header is ignored and the full body is served with `200` — so a resumed download can never mix bytes from two object versions.
-- Objects stored with `Content-Encoding: gzip` cannot be served as partial content (GCS transcodes them and offsets become ambiguous), so the handler falls back to a full `200` body.
+### Transfer encoding
+
+By default gcsproxy omits `Content-Length`, so `net/http` streams anything sizeable with `Transfer-Encoding: chunked`. That sidesteps the [32 MiB non-streamed response cap](https://cloud.google.com/run/quotas) of platforms like Cloud Run. (Small responses may still get an automatic `Content-Length`, which is harmless.)
+
+Pass `-content-length` when clients need the total size up front, e.g. for progress bars — the Cloud Run cap then applies.
+
+### CORS
+
+`-cors-origin <value>` adds `Access-Control-Allow-Origin` to every response, successful or not:
+
+```
+gcsproxy -cors-origin '*'
+gcsproxy -cors-origin 'https://example.com'
+```
+
+That covers [simple cross-origin requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS#simple_requests) — `<img>`, `<link>`, `<video>`, plain `fetch(url)` — which is what static hosting usually needs. Preflighted requests (custom headers, credentialed `fetch`, methods other than `GET`/`HEAD`/`POST`) are not supported; put a proxy such as nginx in front if you need them.
+
+## Operations
+
+### Authentication
+
+gcsproxy uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials), so on GCE, GKE and Cloud Run it picks up the workload's service account automatically. Pass `-c /path/to/key.json` to use a specific service-account key instead. The account only needs read access to the objects (e.g. `roles/storage.objectViewer`).
 
 ### Health check
 
-`/_health` returns `200 OK` with the body `OK`. It does not call GCS and is safe to use as a Kubernetes/Cloud Run liveness or readiness probe. It keeps returning `200` during graceful shutdown, so a liveness probe won't kill the process mid-drain.
+`/_health` returns `200 OK` with the body `OK`. It never calls GCS, so it is safe for Kubernetes and Cloud Run liveness or readiness probes, and it keeps answering `200` during graceful shutdown so a liveness probe won't kill the process mid-drain.
 
 ### Graceful shutdown
 
-On SIGTERM or SIGINT, gcsproxy shuts down in four phases designed to eliminate 502/503s and connection resets during rolling deploys:
+On SIGTERM or SIGINT, gcsproxy shuts down in four phases designed to avoid 502/503s and connection resets during rolling deploys:
 
-1. **Drain** (`-shutdown-delay`): nothing stops — new connections are accepted and requests are served normally, but every response carries `Connection: close`, telling keep-alive clients (e.g. an nginx `upstream keepalive` pool) to retire the connection after use.
-2. **Stop accepting**: the listener closes; new TCP connections are refused. Existing connections keep working.
-3. **Idle grace** (`-shutdown-idle-grace-period`): existing idle connections stay open, because a client may send a request at the exact moment the server would close one (that race is what causes resets). Requests arriving on them are still served, each response again marked `Connection: close`. This phase ends as soon as no connections remain open, so it never waits longer than necessary.
-4. **Close** (`-shutdown-timeout`): remaining idle connections are closed and gcsproxy waits for in-flight requests to finish — at most `-shutdown-timeout` (default `30s`; `0` waits indefinitely) — then exits 0.
+1. **Drain** (`-shutdown-delay`) — new connections are still accepted and requests served normally, but every response carries `Connection: close`, telling keep-alive clients (e.g. an nginx `upstream keepalive` pool) to retire the connection.
+2. **Stop accepting** — the listener closes and new TCP connections are refused. Existing connections keep working.
+3. **Idle grace** (`-shutdown-idle-grace-period`) — idle connections stay open, because closing one while a client sends on it is exactly what causes resets. Requests on them are still served, each marked `Connection: close`. The phase ends as soon as no connections remain.
+4. **Close** (`-shutdown-timeout`) — remaining idle connections are closed and in-flight requests get up to `-shutdown-timeout` (default `30s`; `0` waits forever) to finish. Then gcsproxy exits 0.
 
-`-shutdown-delay` and `-shutdown-idle-grace-period` default to `0s`, which still gives a basic graceful shutdown (in-flight requests complete before exit). Recommended production values:
+With the defaults (`0s` delay and grace), SIGTERM still waits for in-flight requests before exiting. Recommended production values:
 
 ```
 gcsproxy -shutdown-delay 5s -shutdown-idle-grace-period 5s -shutdown-timeout 30s
@@ -317,23 +301,46 @@ gcsproxy -shutdown-delay 5s -shutdown-idle-grace-period 5s -shutdown-timeout 30s
 
 Sizing guidance:
 
-- Set `-shutdown-idle-grace-period` above your clients' idle-connection reuse timeout (nginx upstream `keepalive_timeout`, Go's `Transport.IdleConnTimeout`, etc.) so every pooled connection is either used once more (and cleanly closed) or closed by the client before the server closes it.
-- Make sure your supervisor's kill timeout (systemd `TimeoutStopSec`, Kubernetes `terminationGracePeriodSeconds`) exceeds `shutdown-delay + shutdown-idle-grace-period + shutdown-timeout`, otherwise the process is SIGKILLed mid-drain.
-- A second SIGTERM/SIGINT terminates the process immediately.
-
-Note that even with the default values, SIGTERM now waits for in-flight requests (up to `-shutdown-timeout`) instead of exiting immediately; supervisors backstop this with SIGKILL after their kill timeout.
+- Set `-shutdown-idle-grace-period` above your clients' idle-connection timeout (nginx upstream `keepalive_timeout`, Go's `Transport.IdleConnTimeout`, …), so every pooled connection is either used once more and closed cleanly, or closed by the client first.
+- Keep your supervisor's kill timeout (systemd `TimeoutStopSec`, Kubernetes `terminationGracePeriodSeconds`) above `shutdown-delay + shutdown-idle-grace-period + shutdown-timeout`, or the process is SIGKILLed mid-drain.
+- A second SIGTERM/SIGINT terminates immediately.
 
 ### HTTP/2 cleartext (h2c)
 
-Pass `-h2c` to accept both HTTP/1.1 and HTTP/2 over cleartext TCP (h2c) on the configured bind address. Without this option, only HTTP/1.1 is enabled. This is useful when a TLS-terminating load balancer or reverse proxy forwards HTTP/2 to gcsproxy without re-encrypting the connection, such as Cloud Run with [HTTP/2 end-to-end](https://cloud.google.com/run/docs/configuring/http2) enabled.
+`-h2c` accepts HTTP/2 over cleartext TCP alongside HTTP/1.1 on the same address. Use it when a TLS-terminating load balancer forwards HTTP/2 without re-encrypting, such as Cloud Run with [HTTP/2 end-to-end](https://cloud.google.com/run/docs/configuring/http2).
 
-Only HTTP/2 with prior knowledge is supported: the client must start the connection with the HTTP/2 preface. Upgrading an HTTP/1.1 connection via `Upgrade: h2c` is not supported, and such requests are served over HTTP/1.1.
+Only prior-knowledge h2c is supported: the client must open with the HTTP/2 preface. `Upgrade: h2c` requests are served over HTTP/1.1. During graceful shutdown, HTTP/2 connections receive `GOAWAY` instead of `Connection: close`.
 
-During graceful shutdown, HTTP/2 connections receive a `GOAWAY` frame in place of the `Connection: close` header sent to HTTP/1.1 clients.
+### Logging
 
-### Authentication
+gcsproxy writes structured logs to stderr via `log/slog`. The default `json` format is ready for Cloud Logging, Datadog, Loki and friends:
 
-gcsproxy uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) by default, so on GCE/GKE/Cloud Run it picks up the service account attached to the workload. To use a specific service-account key file, pass `-c /path/to/key.json`.
+```json
+{"time":"2026-05-21T09:00:00Z","level":"INFO","msg":"access","remote":"127.0.0.1","elapsed":0.0042,"status":200,"method":"GET","url":"/bucket/foo/bar"}
+```
+
+- `-v` enables the access log shown above.
+- `-log-format text` switches to human-readable `key=value` output for local runs.
+- `-log-level <debug|info|warn|error>` (default `info`) sets the minimum level; `warn` hides the startup and access logs.
+
+Failed requests are logged as `proxy error` with the status, URL and full GCS error:
+
+```json
+{"time":"2026-05-21T09:00:00Z","level":"ERROR","msg":"proxy error","status":500,"url":"/bucket/foo/bar","err":"googleapi: Error 403: ..."}
+```
+
+Server errors are logged at `ERROR`, `503`s from repeated concurrent overwrites at `WARN`, and missing objects (`404`) and client cancellations at `DEBUG`.
+
+### Error responses
+
+GCS error messages can reveal bucket and object names, or details about the service account's permissions. By default the response body carries only the status text, and the full error goes to the [log](#logging):
+
+```
+GET /test-bucket/missing
+  → 404, body "Not Found"
+```
+
+Pass `-redact-errors=false` to return the GCS error in the body, e.g. while debugging locally.
 
 ## Examples
 
@@ -342,9 +349,11 @@ gcsproxy uses [Application Default Credentials](https://cloud.google.com/docs/au
 ```bash
 docker run --rm -p 8080:80 \
     -e GOOGLE_APPLICATION_CREDENTIALS=/cred.json \
-    -v /path/to/key.json:/cred.json \
-    ghcr.io/daichirata/gcsproxy:latest -v
+    -v /path/to/key.json:/cred.json:ro \
+    ghcr.io/daichirata/gcsproxy:latest -b 0.0.0.0:80 -v
 ```
+
+Arguments replace the image's default command (`-b 0.0.0.0:80`), so keep `-b 0.0.0.0:80` when adding flags.
 
 ### Docker Compose
 
@@ -363,6 +372,8 @@ services:
 ```
 
 ### systemd
+
+A ready-to-use unit is included as [`gcsproxy.service`](gcsproxy.service):
 
 ```ini
 [Unit]
@@ -386,6 +397,7 @@ WantedBy=multi-user.target
 ```nginx
 upstream gcsproxy {
     server 127.0.0.1:8080;
+    keepalive 16;
 }
 
 server {
@@ -401,6 +413,14 @@ server {
 
     location / {
         proxy_pass http://gcsproxy;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
     }
 }
 ```
+
+`keepalive` with HTTP/1.1 and an empty `Connection` header lets nginx reuse upstream connections; gcsproxy's [graceful shutdown](#graceful-shutdown) retires them cleanly during deploys.
+
+## License
+
+[MIT](LICENSE)

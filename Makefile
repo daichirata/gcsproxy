@@ -1,23 +1,21 @@
 BIN_NAME := gcsproxy
 GOFILES := $(shell find . -type f -name '*.go')
 
+.PHONY: build test vet tidy clean
+
 build: bin/$(BIN_NAME)
 
-bin/$(BIN_NAME): $(GOFILES)
+bin/$(BIN_NAME): $(GOFILES) go.mod go.sum
 	go build -o $@ .
 
-build-cross: clean
-	GOOS=linux  GOARCH=amd64 go build -o dist/$(BIN_NAME)_amd64_linux
-	GOOS=darwin GOARCH=amd64 go build -o dist/$(BIN_NAME)_amd64_darwin
-	GOOS=linux  GOARCH=arm go build -o dist/$(BIN_NAME)_arm_linux
-	GOOS=darwin GOARCH=arm go build -o dist/$(BIN_NAME)_arm_darwin
+test:
+	go test -race ./...
+
+vet:
+	go vet ./...
+
+tidy:
+	go mod tidy
 
 clean:
 	rm -rf bin dist
-
-deps:
-	go get -t ./...
-	go mod tidy
-
-test:
-	go test -race -v ./...
