@@ -308,9 +308,6 @@ const (
 	testIndexBody = "<html>index</html>"
 )
 
-// newTestServer spins up an in-process fake GCS server and returns a Server
-// wired to it. Tests configure the returned Server's fields (defaultIndex,
-// spa, etc.) before calling s.handler().
 func newTestServer(t *testing.T, objects []fakestorage.Object) *Server {
 	t.Helper()
 	fakeSrv, err := fakestorage.NewServerWithOptions(fakestorage.Options{
@@ -1865,9 +1862,6 @@ func TestProxy_HEAD_GzippedObject(t *testing.T) {
 	})
 }
 
-// startShutdownServer runs s.serve with handler h on an ephemeral port.
-// Canceling the returned func stands in for SIGTERM; the returned channel
-// receives serve's return value.
 func startShutdownServer(t *testing.T, s *Server, h http.Handler) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -2002,8 +1996,6 @@ func TestShutdown_IdleGraceSkippedWhenNoConnections(t *testing.T) {
 	waitServeDone(t, done) // fails if the wait is not skipped
 }
 
-// dialIdleConn opens a raw keep-alive connection and completes one request on
-// it, leaving it idle like a proxy pool member.
 func dialIdleConn(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
@@ -2391,9 +2383,6 @@ const (
 
 var testUpdated = time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 
-// newETagServer returns a Server backed by a single object with known
-// validators (ETag, Last-Modified, Cache-Control) so conditional tests can
-// assert literal header values.
 func newETagServer(t *testing.T) *Server {
 	t.Helper()
 	return newTestServer(t, []fakestorage.Object{{
@@ -2409,9 +2398,6 @@ func newETagServer(t *testing.T) *Server {
 	}})
 }
 
-// newGzipETagServer stores plaintext gzip-compressed with
-// Content-Encoding: gzip, so fake-gcs-server transcodes it on download
-// exactly like real GCS.
 func newGzipETagServer(t *testing.T, plaintext string) *Server {
 	t.Helper()
 	var buf bytes.Buffer

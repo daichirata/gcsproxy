@@ -163,10 +163,6 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return s.serve(ctx, ln, s.handler())
 }
 
-// serve runs h on ln until ctx is canceled, then executes the phased graceful
-// shutdown: drain (Connection: close) -> close listener -> idle grace ->
-// Shutdown. Idle connections stay open until the idle grace period elapses so
-// clients never race a new request against a server-side close.
 func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) error {
 	tracker := &connTracker{}
 	srv := &http.Server{
@@ -226,10 +222,6 @@ func (s *Server) protocols() *http.Protocols {
 	return p
 }
 
-// connTracker lets the shutdown sequence stop waiting as soon as no
-// connections remain. Active connections count too: a response whose headers
-// predate the drain flag carries no Connection: close, so its connection can
-// still go idle and be reused by the client.
 type connTracker struct {
 	mu     sync.Mutex
 	count  int
@@ -271,8 +263,6 @@ func (ct *connTracker) noneOpen() <-chan struct{} {
 	return ch
 }
 
-// net/http closes the connection after a Connection: close response. Over
-// HTTP/2 the header is stripped and the server sends GOAWAY instead.
 func (s *Server) drainingHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.draining.Load() {
@@ -329,8 +319,6 @@ func (s *Server) wrap(fn http.HandlerFunc) http.HandlerFunc {
 func (s *Server) proxy(w http.ResponseWriter, r *http.Request, bucket, object string) {
 	err := s.proxyOnce(w, r, bucket, object)
 	if errors.Is(err, errGenerationChanged) {
-		// Nothing has been written yet: start over from fresh attrs so the
-		// preconditions and range are evaluated against the new generation.
 		slog.DebugContext(r.Context(), "retrying request", "url", r.URL.String(), "err", err)
 		err = s.proxyOnce(w, r, bucket, object)
 	}
@@ -443,8 +431,6 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, obj
 	if err != nil {
 		return err
 	}
-	// Preconditions apply only to would-be-2xx responses (RFC 9110 §13.2.1):
-	// the SPA fallback revalidates, the -not-found 404 page never does.
 	if status == http.StatusOK && checkPreconditions(w, r, attrs) {
 		return nil
 	}
@@ -473,8 +459,6 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 	setStrHeader(w, "Cache-Control", attrs.CacheControl)
 	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
 	if gzipStored(attrs) {
-		// The gzip and GCS-transcoded variants share this URL, so caches
-		// must key on the request's Accept-Encoding.
 		setStrHeader(w, "Vary", "Accept-Encoding")
 	} else {
 		setStrHeader(w, "Accept-Ranges", "bytes")
@@ -656,8 +640,6 @@ func parseSingleRange(header string, size int64) (start, length int64, err error
 
 var errGenerationChanged = errors.New("object generation changed during request")
 
-// objectHandle pins reads to the generation the validators were derived from,
-// so a concurrent overwrite cannot pair a new body with them.
 func (s *Server) objectHandle(attrs *storage.ObjectAttrs) *storage.ObjectHandle {
 	obj := s.client.Bucket(attrs.Bucket).Object(attrs.Name)
 	if attrs.Generation != 0 {
@@ -666,8 +648,6 @@ func (s *Server) objectHandle(attrs *storage.ObjectAttrs) *storage.ObjectHandle 
 	return obj
 }
 
-// pinnedReadErr turns a not-found from a generation-pinned read into
-// errGenerationChanged, so the request is retried instead of answering 404.
 func pinnedReadErr(attrs *storage.ObjectAttrs, err error) error {
 	if attrs.Generation != 0 && errors.Is(err, storage.ErrObjectNotExist) {
 		return fmt.Errorf("%w (generation %d)", errGenerationChanged, attrs.Generation)
@@ -679,10 +659,6 @@ func gzipStored(attrs *storage.ObjectAttrs) bool {
 	return strings.EqualFold(attrs.ContentEncoding, "gzip")
 }
 
-// gzip-stored objects get a weak tag because the same URL serves two
-// byte-different representations (raw gzip vs GCS-transcoded) depending on
-// the request's Accept-Encoding; the variants are semantically equivalent,
-// which is exactly what a weak tag promises.
 func objectETag(attrs *storage.ObjectAttrs) string {
 	if attrs.Etag == "" {
 		return ""
@@ -725,8 +701,6 @@ func etagWeakMatch(a, b string) bool {
 	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")
 }
 
-// A present-but-empty If-Match/If-None-Match field is treated as absent rather
-// than as a failing precondition, matching net/http semantics.
 func hasETagValues(values []string) bool {
 	for _, v := range values {
 		if textproto.TrimString(v) != "" {
@@ -736,8 +710,6 @@ func hasETagValues(values []string) bool {
 	return false
 }
 
-// "*" matches any existing representation. A malformed member ends scanning
-// of that value, treating the rest as no-match, like net/http/fs.go.
 func anyETagMatches(values []string, target string, strong bool) bool {
 	match := etagWeakMatch
 	if strong {
@@ -769,9 +741,6 @@ func anyETagMatches(values []string, target string, strong bool) bool {
 	return false
 }
 
-// 304 carries the validator headers the equivalent 200 would (RFC 9110
-// §15.4.5); representation headers (Content-Type, Content-Length, ...) are
-// deliberately omitted.
 func writeNotModified(w http.ResponseWriter, attrs *storage.ObjectAttrs) {
 	setStrHeader(w, "ETag", objectETag(attrs))
 	setTimeHeader(w, "Last-Modified", attrs.Updated)
@@ -782,9 +751,6 @@ func writeNotModified(w http.ResponseWriter, attrs *storage.ObjectAttrs) {
 	w.WriteHeader(http.StatusNotModified)
 }
 
-// checkPreconditions follows the evaluation order of RFC 9110 §13.2.2 and
-// reports whether it has written a 412 or 304. Invalid HTTP-dates and unknown
-// (zero) modification times disable the date-based checks.
 func checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs) bool {
 	if ifMatch := r.Header.Values("If-Match"); hasETagValues(ifMatch) {
 		if !anyETagMatches(ifMatch, objectETag(attrs), true) {
@@ -806,8 +772,6 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.O
 			writeNotModified(w, attrs)
 			return true
 		}
-		// If-None-Match present but unmatched: If-Modified-Since MUST be
-		// ignored (RFC 9110 §13.1.3).
 		return false
 	}
 
@@ -825,8 +789,6 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.O
 	return false
 }
 
-// If-Range (RFC 9110 §13.1.5): an entity-tag must strong-match, so weak tags
-// never do; an HTTP-date must equal Last-Modified exactly.
 func ifRangeAllowsPartial(r *http.Request, attrs *storage.ObjectAttrs) bool {
 	ir, ok := header(r, "If-Range")
 	if !ok || ir == "" {
