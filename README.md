@@ -10,11 +10,10 @@
 Keep a bucket private and still serve its objects over HTTP. gcsproxy authenticates to GCS with the host's credentials and streams objects to the client, so you can put any access control you like — IP allowlists, basic auth, IAP — in front of it.
 
 ```
-┌────────────────────────┐        ┌────────────┐        ┌──────────────────┐
-│ nginx / LB / IAP       │  HTTP  │            │  GCS   │                  │
-│ auth · IP allow · TLS  │ ─────▶ │  gcsproxy  │ ─────▶ │  Cloud Storage   │
-│                        │        │            │  API   │  (private)       │
-└────────────────────────┘        └────────────┘        └──────────────────┘
+╭────────╮       ╭───────────────────╮      ╭──────────╮         ╭───────────────╮
+│ Client │ ────▶ │ nginx / LB / IAP  │ ───▶ │ gcsproxy │ ──────▶ │ Cloud Storage │
+╰────────╯ HTTPS ╰───────────────────╯ HTTP ╰──────────╯ GCS API ╰───────────────╯
+                  auth · IP allow · TLS                           private bucket
 ```
 
 ## Contents
