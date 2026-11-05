@@ -140,8 +140,6 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
-// h2cClient returns a client that speaks only HTTP/2 over cleartext TCP with
-// prior knowledge, so a request succeeds only if the server accepts h2c.
 func h2cClient(t *testing.T) *http.Client {
 	t.Helper()
 	tr := &http.Transport{Protocols: new(http.Protocols)}
@@ -205,7 +203,7 @@ func TestServe_H2CDisabledByDefault(t *testing.T) {
 		res.Body.Close()
 		t.Fatalf("h2c request succeeded with proto %s, want error", res.Proto)
 	}
-	getHealth(t, addr) // HTTP/1.1 still works
+	getHealth(t, addr)
 
 	cancel()
 	waitServeDone(t, done)
@@ -232,7 +230,7 @@ func TestShutdown_H2CIdleConnClosedByGOAWAY(t *testing.T) {
 			t.Fatalf("got %s %d, want HTTP/2.0 200", res.Proto, res.StatusCode)
 		}
 	}
-	get() // leaves an idle h2c connection in the client pool
+	get()
 
 	cancel()
 	waitListenerClosed(t, addr)

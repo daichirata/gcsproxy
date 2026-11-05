@@ -211,9 +211,6 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) err
 	return nil
 }
 
-// protocols returns the protocols the server accepts: HTTP/1.1 always, plus
-// HTTP/2 over cleartext TCP with prior knowledge when -h2c is set. The
-// HTTP/1.1 Upgrade: h2c path is not supported.
 func (s *Server) protocols() *http.Protocols {
 	p := new(http.Protocols)
 	p.SetHTTP1(true)
