@@ -3194,7 +3194,6 @@ func TestCheckPreconditions_ZeroUpdated(t *testing.T) {
 	// Unknown (zero) modification time disables the date conditionals
 	// instead of producing a bogus 304/412. The fake always assigns an
 	// Updated time, so this is exercised at the unit level.
-	s := &Server{}
 	attrs := &storage.ObjectAttrs{Etag: testEtag}
 	cases := []struct {
 		name  string
@@ -3209,7 +3208,7 @@ func TestCheckPreconditions_ZeroUpdated(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, "/x", nil)
 			req.Header.Set(tc.key, tc.value)
-			if s.checkPreconditions(rec, req, attrs) {
+			if checkPreconditions(rec, req, attrs) {
 				t.Errorf("checkPreconditions wrote %d, want pass-through for zero Updated", rec.Code)
 			}
 		})
@@ -3221,7 +3220,7 @@ func TestCheckPreconditions_ZeroUpdated(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/x", nil)
 		req.Header.Set("If-None-Match", `"`+testEtag+`"`)
-		if !s.checkPreconditions(rec, req, attrs) {
+		if !checkPreconditions(rec, req, attrs) {
 			t.Fatal("checkPreconditions = false, want 304 written")
 		}
 		if rec.Code != http.StatusNotModified {
@@ -3233,8 +3232,7 @@ func TestCheckPreconditions_ZeroUpdated(t *testing.T) {
 	})
 }
 
-func TestCheckPreconditions_InvalidDate_VerboseWarnLogged(t *testing.T) {
-	s := &Server{verbose: true}
+func TestCheckPreconditions_InvalidDate_DebugLogged(t *testing.T) {
 	attrs := &storage.ObjectAttrs{Etag: testEtag, Updated: testUpdated}
 	cases := []struct {
 		key     string
@@ -3246,12 +3244,12 @@ func TestCheckPreconditions_InvalidDate_VerboseWarnLogged(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.key, func(t *testing.T) {
 			var buf bytes.Buffer
-			installLogger(t, slog.NewTextHandler(&buf, nil))
+			installLogger(t, slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, "/x", nil)
 			req.Header.Set(tc.key, "not-a-date")
-			if s.checkPreconditions(rec, req, attrs) {
+			if checkPreconditions(rec, req, attrs) {
 				t.Errorf("checkPreconditions wrote %d, want pass-through for invalid date", rec.Code)
 			}
 			if !strings.Contains(buf.String(), tc.wantLog) {
