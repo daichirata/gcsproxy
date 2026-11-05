@@ -30,8 +30,6 @@ import (
 
 var version = "dev"
 
-// Keeps slow-header (Slowloris) clients from pinning connections; response
-// streaming is not limited.
 const readHeaderTimeout = 10 * time.Second
 
 type Server struct {
