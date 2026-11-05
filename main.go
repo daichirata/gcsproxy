@@ -516,7 +516,7 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 	}
 
 	w.WriteHeader(status)
-	io.Copy(w, objr)
+	copyBody(w, r, objr)
 	return nil
 }
 
@@ -573,8 +573,20 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 
 	w.WriteHeader(http.StatusPartialContent)
-	io.Copy(w, objr)
+	copyBody(w, r, objr)
 	return nil
+}
+
+// copyBody streams the object after the status line is out, so a failure can
+// only be logged. Client disconnects are routine and logged at debug.
+func copyBody(w http.ResponseWriter, r *http.Request, objr io.Reader) {
+	if _, err := io.Copy(w, objr); err != nil {
+		level := slog.LevelWarn
+		if r.Context().Err() != nil {
+			level = slog.LevelDebug
+		}
+		slog.Log(r.Context(), level, "response body copy failed", "url", r.URL.String(), "err", err)
+	}
 }
 
 // acceptsGzip reports whether the Accept-Encoding field values allow gzip

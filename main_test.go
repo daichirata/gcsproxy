@@ -3602,3 +3602,39 @@ func TestProxy_GzipRefusedByQZero(t *testing.T) {
 		t.Errorf("Content-Encoding = %q, want empty when gzip is refused", got)
 	}
 }
+
+type failingWriter struct{}
+
+func (failingWriter) Header() http.Header       { return http.Header{} }
+func (failingWriter) WriteHeader(int)           {}
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+func TestCopyBody_LogsFailures(t *testing.T) {
+	cases := []struct {
+		name      string
+		cancel    bool
+		wantLevel string
+	}{
+		{"server-side failure", false, "level=WARN"},
+		{"client went away", true, "level=DEBUG"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			installLogger(t, slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				cancel()
+			}
+			req := httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx)
+			copyBody(failingWriter{}, req, strings.NewReader("body"))
+
+			out := buf.String()
+			if !strings.Contains(out, "response body copy failed") || !strings.Contains(out, tc.wantLevel) {
+				t.Errorf("log output %q, want %q at %s", out, "response body copy failed", tc.wantLevel)
+			}
+		})
+	}
+}
