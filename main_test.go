@@ -3540,3 +3540,15 @@ func TestStream_GenerationGone_ReturnsErrGenerationChanged(t *testing.T) {
 		})
 	}
 }
+
+func TestMain_Version(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-version")
+	cmd.Env = append(os.Environ(), "GCSPROXY_RUN_MAIN=1")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("gcsproxy -version: %v", err)
+	}
+	if !strings.HasPrefix(string(out), "gcsproxy ") {
+		t.Errorf("stdout = %q, want prefix %q", out, "gcsproxy ")
+	}
+}

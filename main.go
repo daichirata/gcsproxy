@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,9 @@ import (
 	"github.com/gorilla/mux"
 	"google.golang.org/api/option"
 )
+
+// version is set by goreleaser via -ldflags "-X main.version=...".
+var version = "dev"
 
 // readHeaderTimeout bounds how long a client may take to send its request
 // headers, so slow-header (Slowloris) clients cannot pin connections. It does
@@ -69,8 +73,14 @@ func main() {
 		shutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "Max wait for in-flight requests after the idle grace period; 0 waits indefinitely.")
 		redactErrors    = flag.Bool("redact-errors", true, "Replace error response bodies with the generic HTTP status text.")
 		h2c             = flag.Bool("h2c", false, "Enable cleartext HTTP/2 (h2c) with prior knowledge alongside HTTP/1.1.")
+		showVersion     = flag.Bool("version", false, "Print the version and exit.")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("gcsproxy", buildVersion())
+		return
+	}
 
 	level, err := parseLogLevel(*logLevel)
 	if err != nil {
@@ -152,7 +162,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("listening", "addr", ln.Addr().String())
+	slog.Info("listening", "addr", ln.Addr().String(), "version", buildVersion())
 	return s.serve(ctx, ln, s.handler())
 }
 
@@ -876,6 +886,18 @@ type wrapResponseWriter struct {
 func (w *wrapResponseWriter) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 	w.status = status
+}
+
+// buildVersion falls back to the module version recorded by `go install
+// ...@vX.Y.Z` when the binary was not built by goreleaser.
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
 }
 
 func fatal(msg string, args ...any) {

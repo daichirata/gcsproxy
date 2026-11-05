@@ -124,6 +124,8 @@ Usage of gcsproxy:
   -spa
         SPA fallback: serve -i from the bucket root with HTTP 200 for unmatched routes.
   -v    Show access log.
+  -version
+        Print the version and exit.
   -walk-up-index
         When -i lookup misses, retry parent directories for index files before not-found handling.
 ```
