@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -27,7 +28,6 @@ import (
 	"google.golang.org/api/option"
 )
 
-// version is set by goreleaser via -ldflags "-X main.version=...".
 var version = "dev"
 
 // Keeps slow-header (Slowloris) clients from pinning connections; response
@@ -572,8 +572,6 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	return nil
 }
 
-// The status line is already out, so a failure can only be logged; client
-// disconnects are routine.
 func copyBody(w http.ResponseWriter, r *http.Request, objr io.Reader) {
 	if _, err := io.Copy(w, objr); err != nil {
 		level := slog.LevelWarn
@@ -584,23 +582,19 @@ func copyBody(w http.ResponseWriter, r *http.Request, objr io.Reader) {
 	}
 }
 
-// RFC 9110 §12.5.3: an explicit gzip/x-gzip entry wins over "*", and q=0
-// means "not acceptable".
 func acceptsGzip(values []string) bool {
 	gzipQ, anyQ := -1.0, -1.0
 	for _, v := range values {
 		for _, member := range strings.Split(v, ",") {
-			coding, params, _ := strings.Cut(member, ";")
-			q := 1.0
-			for _, param := range strings.Split(params, ";") {
-				name, value, ok := strings.Cut(strings.TrimSpace(param), "=")
-				if ok && strings.EqualFold(strings.TrimSpace(name), "q") {
-					if f, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
-						q = f
-					}
-				}
+			coding, params, err := mime.ParseMediaType(member)
+			if err != nil && !errors.Is(err, mime.ErrInvalidMediaParameter) {
+				continue
 			}
-			switch strings.ToLower(strings.TrimSpace(coding)) {
+			q := 1.0
+			if f, err := strconv.ParseFloat(params["q"], 64); err == nil {
+				q = f
+			}
+			switch coding {
 			case "gzip", "x-gzip":
 				gzipQ = max(gzipQ, q)
 			case "*":
