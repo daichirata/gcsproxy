@@ -36,6 +36,7 @@ type Server struct {
 	contentLength   bool
 	corsOrigin      string
 	redactErrors    bool
+	h2c             bool
 	verbose         bool
 	shutdownDelay   time.Duration
 	idleGracePeriod time.Duration
@@ -61,6 +62,7 @@ func main() {
 		idleGracePeriod = flag.Duration("shutdown-idle-grace-period", 0, "After the listener closes, keep idle connections open for up to this long; ends early once no connections remain.")
 		shutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "Max wait for in-flight requests after the idle grace period; 0 waits indefinitely.")
 		redactErrors    = flag.Bool("redact-errors", true, "Replace error response bodies with the generic HTTP status text.")
+		h2c             = flag.Bool("h2c", false, "Enable cleartext HTTP/2 (h2c) with prior knowledge alongside HTTP/1.1.")
 	)
 	flag.Parse()
 
@@ -121,6 +123,7 @@ func main() {
 		contentLength:   *contentLength,
 		corsOrigin:      *corsOrigin,
 		redactErrors:    *redactErrors,
+		h2c:             *h2c,
 		verbose:         *verbose,
 		shutdownDelay:   *shutdownDelay,
 		idleGracePeriod: *idleGracePeriod,
@@ -153,7 +156,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // clients never race a new request against a server-side close.
 func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) error {
 	tracker := &connTracker{}
-	srv := &http.Server{Handler: s.drainingHandler(h), ConnState: tracker.connState}
+	srv := &http.Server{
+		Handler:   s.drainingHandler(h),
+		ConnState: tracker.connState,
+		Protocols: s.protocols(),
+	}
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -202,6 +209,13 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) err
 	}
 	slog.Info("shutdown: complete")
 	return nil
+}
+
+func (s *Server) protocols() *http.Protocols {
+	p := new(http.Protocols)
+	p.SetHTTP1(true)
+	p.SetUnencryptedHTTP2(s.h2c)
+	return p
 }
 
 // connTracker counts open server connections via http.Server.ConnState so
@@ -253,7 +267,8 @@ func (ct *connTracker) noneOpen() <-chan struct{} {
 
 // drainingHandler marks every response written after shutdown begins with
 // Connection: close, so keep-alive clients stop reusing the connection.
-// net/http then closes the connection after the response completes.
+// net/http then closes the connection after the response completes. Over
+// HTTP/2 the header is stripped and the server sends GOAWAY instead.
 func (s *Server) drainingHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.draining.Load() {

@@ -48,6 +48,7 @@ curl http://localhost:8080/<your-bucket>/<your-object>
 - Error responses hide GCS error details such as bucket and object names (`-redact-errors`, on by default)
 - Optional `Access-Control-Allow-Origin` header (`-cors-origin`) for simple CORS use cases
 - Structured logging via `log/slog` with text or JSON output (`-log-format`)
+- Optional cleartext HTTP/2 (h2c) support (`-h2c`) alongside HTTP/1.1
 - `/_health` endpoint for liveness/readiness probes
 - Graceful shutdown on SIGTERM/SIGINT with configurable drain windows (`-shutdown-delay`, `-shutdown-idle-grace-period`, `-shutdown-timeout`) for zero-downtime deploys
 
@@ -87,6 +88,8 @@ Usage of gcsproxy:
         Send the Content-Length header (disables chunked transfer).
   -cors-origin string
         Value for the Access-Control-Allow-Origin header.
+  -h2c
+        Enable cleartext HTTP/2 (h2c) with prior knowledge alongside HTTP/1.1.
   -i string
         Default index file to serve.
   -log-format string
@@ -283,6 +286,14 @@ Sizing guidance:
 - A second SIGTERM/SIGINT terminates the process immediately.
 
 Note that even with the default values, SIGTERM now waits for in-flight requests (up to `-shutdown-timeout`) instead of exiting immediately; supervisors backstop this with SIGKILL after their kill timeout.
+
+### HTTP/2 cleartext (h2c)
+
+Pass `-h2c` to accept both HTTP/1.1 and HTTP/2 over cleartext TCP (h2c) on the configured bind address. Without this option, only HTTP/1.1 is enabled. This is useful when a TLS-terminating load balancer or reverse proxy forwards HTTP/2 to gcsproxy without re-encrypting the connection, such as Cloud Run with [HTTP/2 end-to-end](https://cloud.google.com/run/docs/configuring/http2) enabled.
+
+Only HTTP/2 with prior knowledge is supported: the client must start the connection with the HTTP/2 preface. Upgrading an HTTP/1.1 connection via `Upgrade: h2c` is not supported, and such requests are served over HTTP/1.1.
+
+During graceful shutdown, HTTP/2 connections receive a `GOAWAY` frame in place of the `Connection: close` header sent to HTTP/1.1 clients.
 
 ### Authentication
 
