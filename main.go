@@ -26,6 +26,11 @@ import (
 	"google.golang.org/api/option"
 )
 
+// readHeaderTimeout bounds how long a client may take to send its request
+// headers, so slow-header (Slowloris) clients cannot pin connections. It does
+// not limit response streaming.
+const readHeaderTimeout = 10 * time.Second
+
 type Server struct {
 	addr            string
 	client          *storage.Client
@@ -158,9 +163,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) error {
 	tracker := &connTracker{}
 	srv := &http.Server{
-		Handler:   s.drainingHandler(h),
-		ConnState: tracker.connState,
-		Protocols: s.protocols(),
+		Handler:           s.drainingHandler(h),
+		ConnState:         tracker.connState,
+		Protocols:         s.protocols(),
+		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
 	errc := make(chan error, 1)
