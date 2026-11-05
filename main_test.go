@@ -140,6 +140,109 @@ func TestHealthCheck(t *testing.T) {
 	}
 }
 
+// h2cClient returns a client that speaks only HTTP/2 over cleartext TCP with
+// prior knowledge, so a request succeeds only if the server accepts h2c.
+func h2cClient(t *testing.T) *http.Client {
+	t.Helper()
+	tr := &http.Transport{Protocols: new(http.Protocols)}
+	tr.Protocols.SetUnencryptedHTTP2(true)
+	t.Cleanup(tr.CloseIdleConnections)
+	return &http.Client{Transport: tr}
+}
+
+func TestServe_H2C(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:  testBucket,
+			Name:        testObject,
+			ContentType: testCType,
+		},
+		Content: []byte(testContent),
+	}})
+	s.h2c = true
+	addr, cancel, done := startShutdownServer(t, s, s.handler())
+	url := "http://" + addr + "/" + testBucket + "/" + testObject
+
+	for _, tc := range []struct {
+		name      string
+		client    *http.Client
+		wantMajor int
+	}{
+		{"h2c", h2cClient(t), 2},
+		{"http1", &http.Client{Transport: &http.Transport{}}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.client.Get(url)
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatalf("io.ReadAll: %v", err)
+			}
+			if res.ProtoMajor != tc.wantMajor {
+				t.Errorf("proto = %s, want HTTP/%d", res.Proto, tc.wantMajor)
+			}
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d (body=%q)", res.StatusCode, http.StatusOK, body)
+			}
+			if got := string(body); got != testContent {
+				t.Errorf("body = %q, want %q", got, testContent)
+			}
+		})
+	}
+
+	cancel()
+	waitServeDone(t, done)
+}
+
+func TestServe_H2CDisabledByDefault(t *testing.T) {
+	s := newTestServer(t, nil)
+	addr, cancel, done := startShutdownServer(t, s, s.handler())
+
+	if res, err := h2cClient(t).Get("http://" + addr + "/_health"); err == nil {
+		res.Body.Close()
+		t.Fatalf("h2c request succeeded with proto %s, want error", res.Proto)
+	}
+	getHealth(t, addr) // HTTP/1.1 still works
+
+	cancel()
+	waitServeDone(t, done)
+}
+
+func TestShutdown_H2CIdleConnClosedByGOAWAY(t *testing.T) {
+	s := newTestServer(t, nil)
+	s.h2c = true
+	// Far longer than the test runs: the h2c connection must be closed by the
+	// GOAWAY that a drain-window response triggers, never by elapsed time.
+	s.idleGracePeriod = 10 * time.Minute
+	addr, cancel, done := startShutdownServer(t, s, s.handler())
+	client := h2cClient(t)
+
+	get := func() {
+		t.Helper()
+		res, err := client.Get("http://" + addr + "/_health")
+		if err != nil {
+			t.Fatalf("GET /_health: %v", err)
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		if res.ProtoMajor != 2 || res.StatusCode != http.StatusOK {
+			t.Fatalf("got %s %d, want HTTP/2.0 200", res.Proto, res.StatusCode)
+		}
+	}
+	get() // leaves an idle h2c connection in the client pool
+
+	cancel()
+	waitListenerClosed(t, addr)
+
+	// Served on the pooled connection; Connection: close makes the server
+	// send GOAWAY and close it, which ends the idle-grace wait early.
+	get()
+	waitServeDone(t, done)
+}
+
 func TestIndexCandidates(t *testing.T) {
 	cases := []struct {
 		name      string
