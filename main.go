@@ -30,7 +30,7 @@ import (
 
 var version = "dev"
 
-const readHeaderTimeout = 10 * time.Second
+var readHeaderTimeout = 10 * time.Second
 
 type Server struct {
 	addr            string
