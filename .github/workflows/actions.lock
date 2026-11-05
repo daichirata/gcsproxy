@@ -15,7 +15,7 @@ workflows:
         - 'actions/checkout@v7.0.1'
     '.github/workflows/zizmor.yaml':
         - 'actions/checkout@v7.0.1'
-        - 'zizmorcore/zizmor-action@v0.8.0'
+        - 'zizmorcore/zizmor-action@v0.8.1'
 dependencies:
     'actions/checkout@v7.0.1':
         ref: 'v7.0.1'
@@ -32,9 +32,9 @@ dependencies:
         commit: 'sha1-81c6f93d4bc991e510b342a00b419b3bb4efc5c6'
         owner_id: 5429470
         repo_id: 287743349
-    'github/codeql-action@24c54180a607b1449ed407dd24f251e4e9147c8d':
-        ref: 'v4.38.3'
-        commit: 'sha1-24c54180a607b1449ed407dd24f251e4e9147c8d'
+    'github/codeql-action@9b3254085494b55a0f7c4c2b3d2d52cc712ce370':
+        ref: 'v4.39.1'
+        commit: 'sha1-9b3254085494b55a0f7c4c2b3d2d52cc712ce370'
         owner_id: 9919
         repo_id: 259445878
     'goreleaser/goreleaser-action@v7.3.0':
@@ -42,10 +42,10 @@ dependencies:
         commit: 'sha1-a4f02ab5355a589de60d917a659ce617ed19b3de'
         owner_id: 24697112
         repo_id: 209873006
-    'zizmorcore/zizmor-action@v0.8.0':
-        ref: 'v0.8.0'
-        commit: 'sha1-53290badfa369cb0bf7ad16342cb62c2fa47ac7b'
+    'zizmorcore/zizmor-action@v0.8.1':
+        ref: 'v0.8.1'
+        commit: 'sha1-45d7276c9ca790aabd705e31ca99c6185c3e76dd'
         owner_id: 210636713
         repo_id: 985558803
         uses:
-            - 'github/codeql-action@24c54180a607b1449ed407dd24f251e4e9147c8d'
+            - 'github/codeql-action@9b3254085494b55a0f7c4c2b3d2d52cc712ce370'
