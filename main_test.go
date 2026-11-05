@@ -1106,8 +1106,6 @@ func TestProxy_CanceledRequestNotLoggedAtInfoLevel(t *testing.T) {
 
 // --- structured logging tests ---
 
-// installLogger redirects slog.Default() to the given handler for the test
-// duration, restoring the previous default on cleanup.
 func installLogger(t *testing.T, h slog.Handler) {
 	t.Helper()
 	prev := slog.Default()
@@ -1692,19 +1690,8 @@ func TestWarnLog_PassesThroughWarnLevel(t *testing.T) {
 
 // --- HEAD tests ---
 //
-// HEAD must not open a GCS reader: the previous implementation went through
-// the same NewReader / NewRangeReader path as GET, so io.Copy would still
-// download every byte from GCS even though net/http discarded the body
-// (issue #59).
-
-// countingClient wraps a *storage.Client and records the number of object
-// read calls (NewReader / NewRangeReader). We can't introspect those calls
-// directly, but we can detect them by checking the recorder's Body — for
-// HEAD the handler must not write any body bytes.
-//
-// (We rely on the absence of body writes as a proxy for "no GCS read",
-// since the handler always calls io.Copy immediately after opening a
-// reader. Skipping the read implies skipping the io.Copy too.)
+// HEAD must not open a GCS reader, or every byte would be downloaded from GCS
+// only for net/http to discard it (issue #59).
 
 func TestProxy_HEAD_NoBody(t *testing.T) {
 	body := []byte("0123456789abcdef")
@@ -1906,8 +1893,6 @@ func waitServeDone(t *testing.T, done <-chan error) {
 	}
 }
 
-// waitListenerClosed polls until new TCP connections are refused, proving
-// the listener is closed.
 func waitListenerClosed(t *testing.T, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -2450,8 +2435,6 @@ func newGzipETagServer(t *testing.T, plaintext string) *Server {
 	}})
 }
 
-// doRequest performs a request for the standard test object with the given
-// extra headers and returns the recorded response.
 func doRequest(t *testing.T, s *Server, method string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()

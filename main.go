@@ -30,9 +30,8 @@ import (
 // version is set by goreleaser via -ldflags "-X main.version=...".
 var version = "dev"
 
-// readHeaderTimeout bounds how long a client may take to send its request
-// headers, so slow-header (Slowloris) clients cannot pin connections. It does
-// not limit response streaming.
+// Keeps slow-header (Slowloris) clients from pinning connections; response
+// streaming is not limited.
 const readHeaderTimeout = 10 * time.Second
 
 type Server struct {
@@ -235,9 +234,9 @@ func (s *Server) protocols() *http.Protocols {
 	return p
 }
 
-// connTracker counts open server connections via http.Server.ConnState so
-// the shutdown sequence can stop waiting as soon as none remain. Active
-// connections count too: a response whose headers predate the drain flag
+// connTracker lets the shutdown sequence stop waiting as soon as no
+// connections remain. Active connections count too: a response whose headers
+// predate the drain flag
 // carries no Connection: close, so its connection can still go idle and be
 // reused by the client.
 type connTracker struct {
@@ -267,7 +266,6 @@ func (ct *connTracker) open() int {
 	return ct.count
 }
 
-// noneOpen returns a channel that is closed once no connections remain open.
 // Only valid after the listener stopped accepting new connections, since the
 // count never rises again from zero.
 func (ct *connTracker) noneOpen() <-chan struct{} {
@@ -282,9 +280,7 @@ func (ct *connTracker) noneOpen() <-chan struct{} {
 	return ch
 }
 
-// drainingHandler marks every response written after shutdown begins with
-// Connection: close, so keep-alive clients stop reusing the connection.
-// net/http then closes the connection after the response completes. Over
+// net/http closes the connection after a Connection: close response. Over
 // HTTP/2 the header is stripped and the server sends GOAWAY instead.
 func (s *Server) drainingHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -577,8 +573,8 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	return nil
 }
 
-// copyBody streams the object after the status line is out, so a failure can
-// only be logged. Client disconnects are routine and logged at debug.
+// The status line is already out, so a failure can only be logged; client
+// disconnects are routine.
 func copyBody(w http.ResponseWriter, r *http.Request, objr io.Reader) {
 	if _, err := io.Copy(w, objr); err != nil {
 		level := slog.LevelWarn
@@ -589,8 +585,7 @@ func copyBody(w http.ResponseWriter, r *http.Request, objr io.Reader) {
 	}
 }
 
-// acceptsGzip reports whether the Accept-Encoding field values allow gzip
-// (RFC 9110 §12.5.3): an explicit gzip/x-gzip entry wins over "*", and q=0
+// RFC 9110 §12.5.3: an explicit gzip/x-gzip entry wins over "*", and q=0
 // means "not acceptable".
 func acceptsGzip(values []string) bool {
 	gzipQ, anyQ := -1.0, -1.0
@@ -696,7 +691,6 @@ func pinnedReadErr(attrs *storage.ObjectAttrs, err error) error {
 	return err
 }
 
-// gzip-stored objects are subject to GCS decompressive transcoding on download.
 func gzipStored(attrs *storage.ObjectAttrs) bool {
 	return strings.EqualFold(attrs.ContentEncoding, "gzip")
 }
@@ -715,10 +709,7 @@ func objectETag(attrs *storage.ObjectAttrs) string {
 	return `"` + attrs.Etag + `"`
 }
 
-// scanETag determines if a syntactically valid ETag is present at the start
-// of s (RFC 9110 §8.8.3). If so, it returns the ETag (including quotes and
-// any W/ prefix) and the remaining text after it; otherwise ("", "").
-// Ported from net/http/fs.go.
+// Ported from net/http/fs.go (RFC 9110 §8.8.3).
 func scanETag(s string) (etag string, remain string) {
 	s = textproto.TrimString(s)
 	start := 0
