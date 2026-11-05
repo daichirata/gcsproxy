@@ -270,7 +270,7 @@ Details:
 - Date conditionals accept all three HTTP-date formats (IMF-fixdate, RFC 850, asctime) and are compared at the second granularity of `Last-Modified`; invalid dates are ignored per RFC 9110. Malformed entity-tags never match, and a present-but-empty `If-Match`/`If-None-Match` is treated as absent, matching `net/http` semantics.
 - Objects stored with `Content-Encoding: gzip` get a **weak** etag (`W/"…"`) plus `Vary: Accept-Encoding`, because the same URL serves either the raw gzip bytes or the GCS-transcoded body depending on the request's `Accept-Encoding` — two representations that a strong etag must not conflate.
 - Directory requests resolved through the default index file (`-i`, including `-walk-up-index`) and the SPA fallback (`-spa`) revalidate against the *resolved* index object's etag, so clients can cache the app shell. The custom not-found page (`-not-found`) is served with `404` and is never subject to preconditions.
-- Reads are pinned to the generation the validators were derived from, so a concurrent overwrite cannot pair a new body with a stale `ETag`/`Last-Modified`.
+- Reads are pinned to the generation the validators were derived from, so a concurrent overwrite cannot pair a new body with a stale `ETag`/`Last-Modified`. If that generation is already gone (overwritten in a bucket without object versioning), the request is re-evaluated once against the new generation — preconditions, `If-Range` and `Range` included — and answers `503` if it changes again.
 
 ### Range requests
 

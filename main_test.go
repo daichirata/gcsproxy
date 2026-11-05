@@ -933,7 +933,9 @@ func TestProxy_ReaderErrorLeavesNoObjectHeaders(t *testing.T) {
 			}
 		}},
 		{"range", "bytes=0-9", func(s *Server, w http.ResponseWriter, r *http.Request) {
-			s.streamRange(w, r, attrs, r.Header.Get("Range"))
+			if err := s.streamRange(w, r, attrs, r.Header.Get("Range")); err != nil {
+				s.handleError(w, r, err)
+			}
 		}},
 	}
 	for _, tt := range tests {
@@ -3488,4 +3490,55 @@ func TestProxy_GenerationPinnedRead_Smoke(t *testing.T) {
 			t.Errorf("body = %q, want %q", got, testContent[2:6])
 		}
 	})
+}
+
+func TestStream_GenerationGone_ReturnsErrGenerationChanged(t *testing.T) {
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName: testBucket,
+			Name:       testObject,
+			Etag:       testEtag,
+			Generation: 1234,
+		},
+		Content: []byte(testContent),
+	}})
+	// attrs from before a concurrent overwrite: the generation no longer exists.
+	stale := &storage.ObjectAttrs{
+		Bucket:     testBucket,
+		Name:       testObject,
+		Etag:       "stale",
+		Generation: 999,
+		Updated:    testUpdated,
+		Size:       int64(len(testContent)),
+	}
+
+	cases := []struct {
+		name  string
+		serve func(w http.ResponseWriter, r *http.Request) error
+	}{
+		{"full read", func(w http.ResponseWriter, r *http.Request) error {
+			return s.streamObject(w, r, stale, http.StatusOK)
+		}},
+		{"range read", func(w http.ResponseWriter, r *http.Request) error {
+			return s.streamRange(w, r, stale, "bytes=2-5")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/"+testObject, nil)
+			err := tc.serve(rec, req)
+			if !errors.Is(err, errGenerationChanged) {
+				t.Fatalf("err = %v, want errGenerationChanged", err)
+			}
+			if len(rec.Header()) != 0 {
+				t.Errorf("headers = %v, want none before the retry", rec.Header())
+			}
+
+			s.handleError(rec, req, err)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+			}
+		})
+	}
 }

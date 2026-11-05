@@ -324,34 +324,44 @@ func (s *Server) wrap(fn http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) proxy(w http.ResponseWriter, r *http.Request, bucket, object string) {
+	err := s.proxyOnce(w, r, bucket, object)
+	if errors.Is(err, errGenerationChanged) {
+		// Nothing has been written yet: start over from fresh attrs so the
+		// preconditions and range are evaluated against the new generation.
+		slog.DebugContext(r.Context(), "retrying request", "url", r.URL.String(), "err", err)
+		err = s.proxyOnce(w, r, bucket, object)
+	}
+	if err != nil {
+		s.handleError(w, r, err)
+	}
+}
+
+func (s *Server) proxyOnce(w http.ResponseWriter, r *http.Request, bucket, object string) error {
 	attrs, err := s.fetchObjectAttrs(r.Context(), bucket, object)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
+			var serveErr error
 			if s.spa && s.defaultIndex != "" {
-				if serveErr := s.serveObject(w, r, bucket, s.defaultIndex, http.StatusOK); serveErr == nil {
-					return
-				}
+				serveErr = s.serveObject(w, r, bucket, s.defaultIndex, http.StatusOK)
 			} else if s.notFoundPath != "" {
-				if serveErr := s.serveObject(w, r, bucket, s.notFoundPath, http.StatusNotFound); serveErr == nil {
-					return
-				}
+				serveErr = s.serveObject(w, r, bucket, s.notFoundPath, http.StatusNotFound)
+			} else {
+				return err
+			}
+			if serveErr == nil || errors.Is(serveErr, errGenerationChanged) {
+				return serveErr
 			}
 		}
-		s.handleError(w, r, err)
-		return
+		return err
 	}
 	if s.checkPreconditions(w, r, attrs) {
-		return
+		return nil
 	}
 
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" && ifRangeAllowsPartial(r, attrs) {
-		s.streamRange(w, r, attrs, rangeHeader)
-		return
+		return s.streamRange(w, r, attrs, rangeHeader)
 	}
-
-	if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-		s.handleError(w, r, err)
-	}
+	return s.streamObject(w, r, attrs, http.StatusOK)
 }
 
 func (s *Server) fetchObjectAttrs(ctx context.Context, bucket, object string) (*storage.ObjectAttrs, error) {
@@ -448,7 +458,7 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 		var err error
 		objr, err = s.objectHandle(attrs).ReadCompressed(gzipAcceptable).NewReader(r.Context())
 		if err != nil {
-			return err
+			return pinnedReadErr(attrs, err)
 		}
 		defer objr.Close()
 	}
@@ -494,15 +504,12 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 	return nil
 }
 
-func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs, rangeHeader string) {
+func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs, rangeHeader string) error {
 	// GCS transcodes gzip-stored objects on download (verified empirically),
 	// so Range is silently ignored — fall back to a full 200. Other encodings
 	// (br, deflate, ...) are not transcoded and Range works normally.
 	if gzipStored(attrs) {
-		if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-			s.handleError(w, r, err)
-		}
-		return
+		return s.streamObject(w, r, attrs, http.StatusOK)
 	}
 
 	start, length, err := parseSingleRange(rangeHeader, attrs.Size)
@@ -512,14 +519,11 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 			// Per RFC 9110 §14.2 non-"bytes" units must be ignored; we extend
 			// that to unparseable byte-ranges so a malformed header doesn't
 			// downgrade a previously-working download to 416.
-			if err := s.streamObject(w, r, attrs, http.StatusOK); err != nil {
-				s.handleError(w, r, err)
-			}
-			return
+			return s.streamObject(w, r, attrs, http.StatusOK)
 		case errors.Is(err, errRangeUnsatisfiable):
 			setStrHeader(w, "Content-Range", fmt.Sprintf("bytes */%d", attrs.Size))
 			http.Error(w, "Requested Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
-			return
+			return nil
 		}
 	}
 
@@ -527,8 +531,7 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	if r.Method != http.MethodHead {
 		objr, err = s.objectHandle(attrs).NewRangeReader(r.Context(), start, length)
 		if err != nil {
-			s.handleError(w, r, err)
-			return
+			return pinnedReadErr(attrs, err)
 		}
 		defer objr.Close()
 	}
@@ -548,13 +551,14 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	if r.Method == http.MethodHead {
 		setStrHeader(w, "Content-Encoding", attrs.ContentEncoding)
 		w.WriteHeader(http.StatusPartialContent)
-		return
+		return nil
 	}
 
 	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 
 	w.WriteHeader(http.StatusPartialContent)
 	io.Copy(w, objr)
+	return nil
 }
 
 var (
@@ -614,6 +618,10 @@ func parseSingleRange(header string, size int64) (start, length int64, err error
 
 // --- conditional requests (RFC 9110 §13) ---
 
+// errGenerationChanged reports that the generation the validators were
+// derived from was overwritten before its body could be read.
+var errGenerationChanged = errors.New("object generation changed during request")
+
 // objectHandle pins reads to the generation the validators were derived from,
 // so a concurrent overwrite cannot pair a new body with them.
 func (s *Server) objectHandle(attrs *storage.ObjectAttrs) *storage.ObjectHandle {
@@ -622,6 +630,15 @@ func (s *Server) objectHandle(attrs *storage.ObjectAttrs) *storage.ObjectHandle 
 		obj = obj.Generation(attrs.Generation)
 	}
 	return obj
+}
+
+// pinnedReadErr turns a not-found from a generation-pinned read into
+// errGenerationChanged, so the request is retried instead of answering 404.
+func pinnedReadErr(attrs *storage.ObjectAttrs, err error) error {
+	if attrs.Generation != 0 && errors.Is(err, storage.ErrObjectNotExist) {
+		return fmt.Errorf("%w (generation %d)", errGenerationChanged, attrs.Generation)
+	}
+	return err
 }
 
 // gzipStored reports whether the object is stored with Content-Encoding: gzip
@@ -825,6 +842,8 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	status, level := http.StatusInternalServerError, slog.LevelError
 	switch {
+	case errors.Is(err, errGenerationChanged):
+		status, level = http.StatusServiceUnavailable, slog.LevelWarn
 	case errors.Is(err, storage.ErrObjectNotExist):
 		status, level = http.StatusNotFound, slog.LevelDebug
 	case errors.Is(err, context.Canceled):
