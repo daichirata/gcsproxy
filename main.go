@@ -236,9 +236,8 @@ func (s *Server) protocols() *http.Protocols {
 
 // connTracker lets the shutdown sequence stop waiting as soon as no
 // connections remain. Active connections count too: a response whose headers
-// predate the drain flag
-// carries no Connection: close, so its connection can still go idle and be
-// reused by the client.
+// predate the drain flag carries no Connection: close, so its connection can
+// still go idle and be reused by the client.
 type connTracker struct {
 	mu     sync.Mutex
 	count  int
