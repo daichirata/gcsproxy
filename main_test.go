@@ -3552,3 +3552,53 @@ func TestMain_Version(t *testing.T) {
 		t.Errorf("stdout = %q, want prefix %q", out, "gcsproxy ")
 	}
 }
+
+func TestAcceptsGzip(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{"absent", nil, false},
+		{"gzip", []string{"gzip"}, true},
+		{"list", []string{"br, gzip, deflate"}, true},
+		{"case and spaces", []string{"  GZip ;Q=0.5 "}, true},
+		{"x-gzip", []string{"x-gzip"}, true},
+		{"q=0 refuses", []string{"gzip;q=0"}, false},
+		{"q=0.0 refuses", []string{"br, gzip;q=0.0"}, false},
+		{"wildcard", []string{"*"}, true},
+		{"wildcard refused", []string{"*;q=0"}, false},
+		{"explicit gzip beats wildcard", []string{"*, gzip;q=0"}, false},
+		{"explicit gzip beats refused wildcard", []string{"*;q=0, gzip"}, true},
+		{"other codings only", []string{"br, deflate"}, false},
+		{"multiple field lines", []string{"br", "gzip"}, true},
+		{"unparsable q keeps default", []string{"gzip;q=abc"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := acceptsGzip(tc.values); got != tc.want {
+				t.Errorf("acceptsGzip(%q) = %v, want %v", tc.values, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProxy_GzipRefusedByQZero(t *testing.T) {
+	var raw bytes.Buffer
+	zw := gzip.NewWriter(&raw)
+	zw.Write([]byte(testContent))
+	zw.Close()
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:      testBucket,
+			Name:            testObject,
+			ContentEncoding: "gzip",
+		},
+		Content: raw.Bytes(),
+	}})
+
+	rec := doRequest(t, s, http.MethodHead, map[string]string{"Accept-Encoding": "gzip;q=0"})
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want empty when gzip is refused", got)
+	}
+}

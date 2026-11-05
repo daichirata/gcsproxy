@@ -465,7 +465,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, obj
 }
 
 func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs, status int) error {
-	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+	gzipAcceptable := acceptsGzip(r.Header.Values("Accept-Encoding"))
 
 	// Open the reader before setting any header so that a failure leaves the
 	// response clean for handleError.
@@ -575,6 +575,37 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	w.WriteHeader(http.StatusPartialContent)
 	io.Copy(w, objr)
 	return nil
+}
+
+// acceptsGzip reports whether the Accept-Encoding field values allow gzip
+// (RFC 9110 §12.5.3): an explicit gzip/x-gzip entry wins over "*", and q=0
+// means "not acceptable".
+func acceptsGzip(values []string) bool {
+	gzipQ, anyQ := -1.0, -1.0
+	for _, v := range values {
+		for _, member := range strings.Split(v, ",") {
+			coding, params, _ := strings.Cut(member, ";")
+			q := 1.0
+			for _, param := range strings.Split(params, ";") {
+				name, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(name), "q") {
+					if f, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+						q = f
+					}
+				}
+			}
+			switch strings.ToLower(strings.TrimSpace(coding)) {
+			case "gzip", "x-gzip":
+				gzipQ = max(gzipQ, q)
+			case "*":
+				anyQ = max(anyQ, q)
+			}
+		}
+	}
+	if gzipQ >= 0 {
+		return gzipQ > 0
+	}
+	return anyQ > 0
 }
 
 var (
