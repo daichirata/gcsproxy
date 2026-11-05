@@ -616,10 +616,6 @@ func parseSingleRange(header string, size int64) (start, length int64, err error
 	return s, e - s + 1, nil
 }
 
-// --- conditional requests (RFC 9110 §13) ---
-
-// errGenerationChanged reports that the generation the validators were
-// derived from was overwritten before its body could be read.
 var errGenerationChanged = errors.New("object generation changed during request")
 
 // objectHandle pins reads to the generation the validators were derived from,
@@ -641,13 +637,11 @@ func pinnedReadErr(attrs *storage.ObjectAttrs, err error) error {
 	return err
 }
 
-// gzipStored reports whether the object is stored with Content-Encoding: gzip
-// and is therefore subject to GCS decompressive transcoding on download.
+// gzip-stored objects are subject to GCS decompressive transcoding on download.
 func gzipStored(attrs *storage.ObjectAttrs) bool {
 	return strings.EqualFold(attrs.ContentEncoding, "gzip")
 }
 
-// objectETag returns the ETag header value for attrs, or "" when unknown.
 // gzip-stored objects get a weak tag because the same URL serves two
 // byte-different representations (raw gzip vs GCS-transcoded) depending on
 // the request's Accept-Encoding; the variants are semantically equivalent,
@@ -689,20 +683,15 @@ func scanETag(s string) (etag string, remain string) {
 	return "", ""
 }
 
-// etagStrongMatch reports whether a and b match using strong ETag comparison:
-// both must be non-weak and identical.
 func etagStrongMatch(a, b string) bool {
 	return a == b && a != "" && a[0] == '"'
 }
 
-// etagWeakMatch reports whether a and b match using weak ETag comparison,
-// ignoring any W/ prefix on either side.
 func etagWeakMatch(a, b string) bool {
 	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")
 }
 
-// hasETagValues reports whether any of the header values is non-empty, so a
-// present-but-empty If-Match/If-None-Match field is treated as absent rather
+// A present-but-empty If-Match/If-None-Match field is treated as absent rather
 // than as a failing precondition, matching net/http semantics.
 func hasETagValues(values []string) bool {
 	for _, v := range values {
@@ -713,10 +702,8 @@ func hasETagValues(values []string) bool {
 	return false
 }
 
-// anyETagMatches reports whether target matches any entity-tag in the given
-// header values (each possibly a comma-separated list). "*" matches any
-// existing representation. A malformed member ends scanning of that value,
-// treating the rest as no-match, like net/http/fs.go.
+// "*" matches any existing representation. A malformed member ends scanning
+// of that value, treating the rest as no-match, like net/http/fs.go.
 func anyETagMatches(values []string, target string, strong bool) bool {
 	match := etagWeakMatch
 	if strong {
@@ -748,9 +735,9 @@ func anyETagMatches(values []string, target string, strong bool) bool {
 	return false
 }
 
-// writeNotModified sends 304 with the validator headers the equivalent 200
-// would carry (RFC 9110 §15.4.5). Representation headers (Content-Type,
-// Content-Length, ...) are deliberately omitted.
+// 304 carries the validator headers the equivalent 200 would (RFC 9110
+// §15.4.5); representation headers (Content-Type, Content-Length, ...) are
+// deliberately omitted.
 func writeNotModified(w http.ResponseWriter, attrs *storage.ObjectAttrs) {
 	setStrHeader(w, "ETag", objectETag(attrs))
 	setTimeHeader(w, "Last-Modified", attrs.Updated)
@@ -761,12 +748,9 @@ func writeNotModified(w http.ResponseWriter, attrs *storage.ObjectAttrs) {
 	w.WriteHeader(http.StatusNotModified)
 }
 
-// checkPreconditions evaluates If-Match, If-Unmodified-Since, If-None-Match
-// and If-Modified-Since against the resolved object in the order mandated by
-// RFC 9110 §13.2.2, writing a 412 or 304 when a precondition fails. It
-// reports whether the response has been written. Invalid HTTP-dates and
-// unknown (zero) modification times disable the date-based checks; malformed
-// entity-tags are treated as no-match.
+// checkPreconditions follows the evaluation order of RFC 9110 §13.2.2 and
+// reports whether it has written a 412 or 304. Invalid HTTP-dates and unknown
+// (zero) modification times disable the date-based checks.
 func (s *Server) checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs) bool {
 	if ifMatch := r.Header.Values("If-Match"); hasETagValues(ifMatch) {
 		if !anyETagMatches(ifMatch, objectETag(attrs), true) {
@@ -811,11 +795,8 @@ func (s *Server) checkPreconditions(w http.ResponseWriter, r *http.Request, attr
 	return false
 }
 
-// ifRangeAllowsPartial reports whether a Range header may be honored given
-// the request's If-Range field (RFC 9110 §13.1.5): absent → yes; an
-// entity-tag must strong-match the current ETag (weak tags never match); an
-// HTTP-date must equal Last-Modified exactly, at the header's second
-// precision. On mismatch the caller serves the full body instead.
+// If-Range (RFC 9110 §13.1.5): an entity-tag must strong-match, so weak tags
+// never do; an HTTP-date must equal Last-Modified exactly.
 func ifRangeAllowsPartial(r *http.Request, attrs *storage.ObjectAttrs) bool {
 	ir, ok := header(r, "If-Range")
 	if !ok || ir == "" {
