@@ -185,12 +185,10 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) err
 	case <-ctx.Done():
 	}
 
-	// Phase 1: keep serving; every new response tells clients to stop reusing.
 	s.draining.Store(true)
 	slog.Info("shutdown: draining", "delay", s.shutdownDelay)
 	time.Sleep(s.shutdownDelay)
 
-	// Phase 2: stop accepting new connections. Existing conns keep working.
 	slog.Info("shutdown: closing listener")
 	ln.Close()
 	// Wait for Serve to return so it untracks its listener; otherwise Shutdown
@@ -199,9 +197,6 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) err
 		slog.Warn("shutdown: serve loop exited with error", "err", err)
 	}
 
-	// Phase 3: leave idle connections open; requests on them are still served.
-	// Skip the wait when no connections remain, and end it early once the
-	// last one closes.
 	slog.Info("shutdown: waiting before closing idle connections", "grace", s.idleGracePeriod, "open", tracker.open())
 	select {
 	case <-tracker.noneOpen():
@@ -209,7 +204,6 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) err
 	case <-time.After(s.idleGracePeriod):
 	}
 
-	// Phase 4: close idle connections, wait for in-flight requests.
 	slog.Info("shutdown: closing idle connections", "timeout", s.shutdownTimeout)
 	sctx := context.Background()
 	if s.shutdownTimeout > 0 {
@@ -624,7 +618,6 @@ func parseSingleRange(header string, size int64) (start, length int64, err error
 	startStr, endStr := spec[:dash], spec[dash+1:]
 
 	if startStr == "" {
-		// Suffix range: -N → last N bytes.
 		n, perr := strconv.ParseInt(endStr, 10, 64)
 		if perr != nil || n <= 0 {
 			return 0, 0, errRangeIgnore
@@ -913,8 +906,6 @@ func (w *wrapResponseWriter) WriteHeader(status int) {
 	w.status = status
 }
 
-// buildVersion falls back to the module version recorded by `go install
-// ...@vX.Y.Z` when the binary was not built by goreleaser.
 func buildVersion() string {
 	if version != "dev" {
 		return version
