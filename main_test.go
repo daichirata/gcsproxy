@@ -236,8 +236,6 @@ func TestShutdown_H2CIdleConnClosedByGOAWAY(t *testing.T) {
 	cancel()
 	waitListenerClosed(t, addr)
 
-	// Served on the pooled connection; Connection: close makes the server
-	// send GOAWAY and close it, which ends the idle-grace wait early.
 	get()
 	waitServeDone(t, done)
 }
@@ -308,9 +306,6 @@ const (
 	testIndexBody = "<html>index</html>"
 )
 
-// newTestServer spins up an in-process fake GCS server and returns a Server
-// wired to it. Tests configure the returned Server's fields (defaultIndex,
-// spa, etc.) before calling s.handler().
 func newTestServer(t *testing.T, objects []fakestorage.Object) *Server {
 	t.Helper()
 	fakeSrv, err := fakestorage.NewServerWithOptions(fakestorage.Options{
@@ -467,8 +462,6 @@ func TestProxy_DefaultIndex_SubdirectoryFallback(t *testing.T) {
 	s.defaultIndex = "index.html"
 
 	rec := httptest.NewRecorder()
-	// Request a path that does not exist as an object; fetchObjectAttrs should
-	// retry by appending the default index file ("foo/" + "index.html").
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/foo/", nil)
 	s.handler().ServeHTTP(rec, req)
 
@@ -605,7 +598,6 @@ func TestE2E_PrefixRewrite_SearchRouteWithWalkUp(t *testing.T) {
 }
 
 func TestProxy_HealthCheckRoute(t *testing.T) {
-	// Health endpoint must not require GCS credentials.
 	s := newTestServer(t, nil)
 
 	rec := httptest.NewRecorder()
@@ -633,7 +625,6 @@ func TestProxy_SourceBucket_OK(t *testing.T) {
 	s.sourceBucket = testBucket
 
 	rec := httptest.NewRecorder()
-	// In source-bucket mode the path no longer carries the bucket name.
 	req := httptest.NewRequest(http.MethodGet, "/"+testObject, nil)
 	s.handler().ServeHTTP(rec, req)
 
@@ -677,7 +668,6 @@ func TestProxy_SourceBucket_DefaultIndex(t *testing.T) {
 	s.sourceBucket = testBucket
 
 	rec := httptest.NewRecorder()
-	// Root path "/" with default index should resolve to bucket's index.html.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	s.handler().ServeHTTP(rec, req)
 
@@ -690,9 +680,6 @@ func TestProxy_SourceBucket_DefaultIndex(t *testing.T) {
 }
 
 func TestProxy_SourceBucket_IgnoresPathBucket(t *testing.T) {
-	// When -bucket is set, the first path segment is part of the object key,
-	// not a bucket selector. A request like "/other-bucket/file.txt" should
-	// look for object "other-bucket/file.txt" in the configured bucket.
 	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName:  testBucket,
@@ -745,7 +732,6 @@ func TestProxy_SPA_FallbackToRootIndex(t *testing.T) {
 	s.spa = true
 
 	rec := httptest.NewRecorder()
-	// Arbitrary path that doesn't exist as an object.
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/some/spa/route", nil)
 	s.handler().ServeHTTP(rec, req)
 
@@ -784,7 +770,6 @@ func TestProxy_SPA_PassthroughForExistingObject(t *testing.T) {
 }
 
 func TestProxy_SPA_NoRootIndexReturns404(t *testing.T) {
-	// SPA enabled but the root index.html itself does not exist.
 	s := newTestServer(t, nil)
 	s.defaultIndex = "index.html"
 	s.spa = true
@@ -878,7 +863,6 @@ func TestProxy_NotFound_NotInvokedForExistingObject(t *testing.T) {
 }
 
 func TestProxy_NotFound_MissingPageFallsBackToDefault404(t *testing.T) {
-	// The configured not-found object itself doesn't exist in the bucket.
 	s := newTestServer(t, nil)
 	s.notFoundPath = "404.html"
 
@@ -971,7 +955,6 @@ func TestProxy_ReaderErrorLeavesNoObjectHeaders(t *testing.T) {
 
 func TestProxy_RedactErrors_DisabledKeepsErrorBody(t *testing.T) {
 	s := newTestServer(t, nil)
-	// s.redactErrors left as false (zero value)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
@@ -1003,7 +986,6 @@ func TestProxy_RedactErrors_CORSHeaderStillSet(t *testing.T) {
 }
 
 func TestProxy_NotFoundLoggedAtDebugLevel(t *testing.T) {
-	// The full error detail is logged even when the response body is redacted.
 	s := newTestServer(t, nil)
 	s.redactErrors = true
 
@@ -1106,8 +1088,6 @@ func TestProxy_CanceledRequestNotLoggedAtInfoLevel(t *testing.T) {
 
 // --- structured logging tests ---
 
-// installLogger redirects slog.Default() to the given handler for the test
-// duration, restoring the previous default on cleanup.
 func installLogger(t *testing.T, h slog.Handler) {
 	t.Helper()
 	prev := slog.Default()
@@ -1133,8 +1113,6 @@ func TestAccessLog_JSONFormat(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
-	// Verify the access log was emitted as a single JSON line with the
-	// expected structured fields.
 	logLine := strings.TrimSpace(buf.String())
 	if logLine == "" {
 		t.Fatal("no log output captured")
@@ -1165,7 +1143,6 @@ func TestAccessLog_NotEmittedWithoutVerbose(t *testing.T) {
 		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
 		Content:     []byte(testContent),
 	}})
-	// s.verbose left as false (zero value)
 
 	var buf bytes.Buffer
 	installLogger(t, slog.NewJSONHandler(&buf, nil))
@@ -1248,8 +1225,6 @@ func TestProxy_CORSOrigin_Set(t *testing.T) {
 }
 
 func TestProxy_CORSOrigin_AppliesToErrorResponses(t *testing.T) {
-	// CORS header must be present even on 404 so the browser surfaces the
-	// real status to JS instead of treating it as an opaque CORS failure.
 	s := newTestServer(t, nil)
 	s.corsOrigin = "*"
 
@@ -1292,7 +1267,6 @@ func TestParseSingleRange(t *testing.T) {
 		wantStart  int64
 		wantLength int64
 	}{
-		// Satisfiable
 		{"explicit", "bytes=0-499", size, nil, 0, 500},
 		{"explicit middle", "bytes=100-199", size, nil, 100, 100},
 		{"single byte", "bytes=0-0", size, nil, 0, 1},
@@ -1302,7 +1276,6 @@ func TestParseSingleRange(t *testing.T) {
 		{"end clamped", "bytes=900-2000", size, nil, 900, 100},
 		{"multi-range uses first", "bytes=0-99,200-299", size, nil, 0, 100},
 
-		// Ignored (treated as if no Range header)
 		{"non-bytes unit", "items=0-10", size, errRangeIgnore, 0, 0},
 		{"missing prefix", "0-99", size, errRangeIgnore, 0, 0},
 		{"empty", "", size, errRangeIgnore, 0, 0},
@@ -1311,7 +1284,6 @@ func TestParseSingleRange(t *testing.T) {
 		{"non-numeric start", "bytes=abc-100", size, errRangeIgnore, 0, 0},
 		{"non-numeric end", "bytes=0-def", size, errRangeIgnore, 0, 0},
 
-		// Unsatisfiable
 		{"start past end", "bytes=1000-1100", size, errRangeUnsatisfiable, 0, 0},
 		{"start past end (open)", "bytes=1500-", size, errRangeUnsatisfiable, 0, 0},
 		{"end before start", "bytes=500-100", size, errRangeUnsatisfiable, 0, 0},
@@ -1465,10 +1437,6 @@ func TestProxy_Range_WithSourceBucket(t *testing.T) {
 }
 
 func TestProxy_Range_HonorsContentLengthFlag(t *testing.T) {
-	// 206 responses follow the same -content-length policy as 200
-	// responses: omitted by default (so large ranges bypass the Cloud Run
-	// 32 MiB non-streamed payload cap via chunked encoding) and emitted
-	// only when -content-length is opted in.
 	body := []byte("0123456789abcdef")
 
 	t.Run("default omits Content-Length", func(t *testing.T) {
@@ -1512,11 +1480,6 @@ func TestProxy_Range_HonorsContentLengthFlag(t *testing.T) {
 }
 
 func TestProxy_Range_GzippedObject_FallsBackToFullBody(t *testing.T) {
-	// Objects stored with Content-Encoding: gzip cannot be served as
-	// partial content reliably (GCS transcodes them, and NewRangeReader
-	// silently ignores the range — verified against real GCS). The
-	// handler should serve the full body with 200 instead of returning a
-	// truncated 206.
 	body := []byte("0123456789abcdef")
 	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
@@ -1539,19 +1502,12 @@ func TestProxy_Range_GzippedObject_FallsBackToFullBody(t *testing.T) {
 	if got := rec.Header().Get("Content-Range"); got != "" {
 		t.Errorf("Content-Range should not be set on the fallback, got %q", got)
 	}
-	// Accept-Ranges: bytes is intentionally omitted for gzip-encoded
-	// objects because partial content is not actually supported (the
-	// handler falls back to full body), so advertising range support
-	// would be misleading.
 	if got := rec.Header().Get("Accept-Ranges"); got != "" {
 		t.Errorf("Accept-Ranges should not be advertised for gzip-encoded objects, got %q", got)
 	}
 }
 
 func TestProxy_Range_NonBytesUnit_Ignored(t *testing.T) {
-	// RFC 7233 §3.1: unknown range units must be ignored — fall back to
-	// a normal 200 response, not 416. This protects against intermediate
-	// proxies or clients that send exotic Range headers.
 	body := []byte("0123456789abcdef")
 	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
@@ -1595,9 +1551,6 @@ func TestProxy_Range_MalformedHeader_Ignored(t *testing.T) {
 }
 
 func TestProxy_Range_ForwardsContentEncoding(t *testing.T) {
-	// Non-gzip encodings (br, deflate, etc.) are not transcoded by GCS,
-	// so Range works over the stored bytes. The encoding MUST be forwarded
-	// to the client so they know how to interpret the partial body.
 	body := []byte("0123456789abcdef")
 	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
@@ -1655,8 +1608,6 @@ func TestParseLogLevel(t *testing.T) {
 }
 
 func TestAccessLog_SuppressedByLogLevel(t *testing.T) {
-	// Even with -v on, an access log at INFO is filtered out when the
-	// handler level is WARN.
 	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{BucketName: testBucket, Name: testObject, ContentType: testCType},
 		Content:     []byte(testContent),
@@ -1679,7 +1630,6 @@ func TestAccessLog_SuppressedByLogLevel(t *testing.T) {
 }
 
 func TestWarnLog_PassesThroughWarnLevel(t *testing.T) {
-	// A slog.Warn call should still appear when the handler level is WARN.
 	var buf bytes.Buffer
 	installLogger(t, slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
@@ -1692,19 +1642,8 @@ func TestWarnLog_PassesThroughWarnLevel(t *testing.T) {
 
 // --- HEAD tests ---
 //
-// HEAD must not open a GCS reader: the previous implementation went through
-// the same NewReader / NewRangeReader path as GET, so io.Copy would still
-// download every byte from GCS even though net/http discarded the body
-// (issue #59).
-
-// countingClient wraps a *storage.Client and records the number of object
-// read calls (NewReader / NewRangeReader). We can't introspect those calls
-// directly, but we can detect them by checking the recorder's Body — for
-// HEAD the handler must not write any body bytes.
-//
-// (We rely on the absence of body writes as a proxy for "no GCS read",
-// since the handler always calls io.Copy immediately after opening a
-// reader. Skipping the read implies skipping the io.Copy too.)
+// HEAD must not open a GCS reader, or every byte would be downloaded from GCS
+// only for net/http to discard it (issue #59).
 
 func TestProxy_HEAD_NoBody(t *testing.T) {
 	body := []byte("0123456789abcdef")
@@ -1828,8 +1767,6 @@ func TestProxy_HEAD_Range_NonBytesUnitIgnored(t *testing.T) {
 }
 
 func TestProxy_HEAD_GzippedObject(t *testing.T) {
-	// HEAD on a gzip-stored object should still avoid the body copy and
-	// produce sensible headers based on Accept-Encoding negotiation.
 	body := []byte("0123456789abcdef")
 	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
@@ -1870,17 +1807,12 @@ func TestProxy_HEAD_GzippedObject(t *testing.T) {
 		if got := rec.Body.Len(); got != 0 {
 			t.Errorf("body length = %d, want 0", got)
 		}
-		// GCS would transcode for GET in this case, so neither
-		// Content-Encoding nor a definitive Content-Length applies.
 		if got := rec.Header().Get("Content-Encoding"); got != "" {
 			t.Errorf("Content-Encoding = %q, want empty", got)
 		}
 	})
 }
 
-// startShutdownServer runs s.serve with handler h on an ephemeral port.
-// Canceling the returned func stands in for SIGTERM; the returned channel
-// receives serve's return value.
 func startShutdownServer(t *testing.T, s *Server, h http.Handler) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1906,8 +1838,6 @@ func waitServeDone(t *testing.T, done <-chan error) {
 	}
 }
 
-// waitListenerClosed polls until new TCP connections are refused, proving
-// the listener is closed.
 func waitListenerClosed(t *testing.T, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -1954,8 +1884,6 @@ func TestShutdown_DrainWindowSendsConnectionClose(t *testing.T) {
 	}
 
 	cancel()
-	// Every drain-window response must be 200 (getHealth asserts that) and
-	// gain Connection: close once draining is visible.
 	deadline := time.Now().Add(30 * time.Second)
 	for !getHealth(t, addr).Close {
 		if time.Now().After(deadline) {
@@ -1979,8 +1907,6 @@ func TestShutdown_IdleConnServedAfterListenerClose(t *testing.T) {
 	cancel()
 	waitListenerClosed(t, addr) // also asserts brand-new conns are refused
 
-	// A request on the idle connection during the idle grace period must
-	// still be served, with Connection: close.
 	if _, err := io.WriteString(conn, "GET /_health HTTP/1.1\r\nHost: gcsproxy.test\r\n\r\n"); err != nil {
 		t.Fatalf("write request on idle conn: %v", err)
 	}
@@ -1999,8 +1925,6 @@ func TestShutdown_IdleConnServedAfterListenerClose(t *testing.T) {
 		t.Fatal("response after listener close lacks Connection: close")
 	}
 
-	// After that response the server closes the connection cleanly, and with
-	// no connections left the idle-grace wait ends early.
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	if _, err := br.ReadByte(); err != io.EOF {
 		t.Fatalf("read after final response = %v, want io.EOF", err)
@@ -2017,8 +1941,6 @@ func TestShutdown_IdleGraceSkippedWhenNoConnections(t *testing.T) {
 	waitServeDone(t, done) // fails if the wait is not skipped
 }
 
-// dialIdleConn opens a raw keep-alive connection and completes one request on
-// it, leaving it idle like a proxy pool member.
 func dialIdleConn(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
@@ -2057,7 +1979,6 @@ func TestShutdown_IdleGraceEndsWhenIdleConnsClose(t *testing.T) {
 	cancel()
 	waitListenerClosed(t, addr)
 
-	// The idle connection is still open, so shutdown must keep waiting.
 	select {
 	case err := <-done:
 		t.Fatalf("serve returned %v while an idle connection was open", err)
@@ -2079,7 +2000,6 @@ func TestShutdown_IdleGraceWaitsForAllIdleConns(t *testing.T) {
 	cancel()
 	waitListenerClosed(t, addr)
 
-	// Closing one of two idle connections must not end the wait.
 	conn1.Close()
 	select {
 	case err := <-done:
@@ -2100,8 +2020,6 @@ func TestShutdown_IdleConnClosedAfterIdleGraceElapses(t *testing.T) {
 
 	cancel()
 
-	// The client never uses or closes the idle connection, so once the
-	// idle grace period elapses the server closes it.
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	if _, err := br.ReadByte(); err != io.EOF {
 		t.Fatalf("read on abandoned idle conn = %v, want io.EOF", err)
@@ -2161,7 +2079,6 @@ func TestShutdown_WaitsForInFlightRequest(t *testing.T) {
 	cancel()
 	waitListenerClosed(t, addr)
 
-	// Shutdown must keep waiting while the request is in flight.
 	select {
 	case err := <-done:
 		t.Fatalf("serve returned %v before the in-flight request completed", err)
@@ -2221,7 +2138,6 @@ func TestShutdown_TimeoutForcesClose(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("server did not shut down after the timeout")
 	}
-	// The stuck request's connection was force-closed without a response.
 	if err := <-errc; err == nil {
 		t.Fatal("stuck in-flight request succeeded, want connection error")
 	}
@@ -2406,9 +2322,6 @@ const (
 
 var testUpdated = time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 
-// newETagServer returns a Server backed by a single object with known
-// validators (ETag, Last-Modified, Cache-Control) so conditional tests can
-// assert literal header values.
 func newETagServer(t *testing.T) *Server {
 	t.Helper()
 	return newTestServer(t, []fakestorage.Object{{
@@ -2424,9 +2337,6 @@ func newETagServer(t *testing.T) *Server {
 	}})
 }
 
-// newGzipETagServer stores plaintext gzip-compressed with
-// Content-Encoding: gzip, so fake-gcs-server transcodes it on download
-// exactly like real GCS.
 func newGzipETagServer(t *testing.T, plaintext string) *Server {
 	t.Helper()
 	var buf bytes.Buffer
@@ -2450,8 +2360,6 @@ func newGzipETagServer(t *testing.T, plaintext string) *Server {
 	}})
 }
 
-// doRequest performs a request for the standard test object with the given
-// extra headers and returns the recorded response.
 func doRequest(t *testing.T, s *Server, method string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -2720,7 +2628,6 @@ func TestProxy_IfNoneMatch_Match(t *testing.T) {
 	if rec.Body.Len() != 0 {
 		t.Errorf("body should be empty, got %q", rec.Body.String())
 	}
-	// 304 must carry the validators the 200 would have (RFC 9110 §15.4.5).
 	if got := rec.Header().Get("ETag"); got != `"`+testEtag+`"` {
 		t.Errorf("ETag = %q, want %q", got, `"`+testEtag+`"`)
 	}
@@ -2784,7 +2691,6 @@ func TestProxy_IfNoneMatch_MultipleHeaderLines(t *testing.T) {
 
 func TestProxy_IfNoneMatch_Malformed(t *testing.T) {
 	s := newETagServer(t)
-	// Unquoted value is not a valid entity-tag: treated as no-match.
 	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-None-Match": testEtag})
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -2875,7 +2781,6 @@ func TestProxy_IfModifiedSince_304_IncludesValidatorHeaders(t *testing.T) {
 	if got := rec.Header().Get("Cache-Control"); got != testCacheCtl {
 		t.Errorf("Cache-Control = %q, want %q", got, testCacheCtl)
 	}
-	// Representation headers must be absent on 304.
 	if got := rec.Header().Get("Content-Type"); got != "" {
 		t.Errorf("Content-Type = %q, want empty on 304", got)
 	}
@@ -3057,8 +2962,6 @@ func TestProxy_IfUnmodifiedSince_InvalidDate_Ignored(t *testing.T) {
 }
 
 func TestProxy_IfMatch_EmptyHeader_TreatedAsAbsent(t *testing.T) {
-	// A present-but-empty If-Match must not fail the precondition
-	// (net/http semantics for invalid field syntax).
 	s := newETagServer(t)
 	rec := doRequest(t, s, http.MethodGet, map[string]string{"If-Match": ""})
 	if rec.Code != http.StatusOK {
@@ -3070,8 +2973,6 @@ func TestProxy_IfMatch_EmptyHeader_TreatedAsAbsent(t *testing.T) {
 }
 
 func TestProxy_IfNoneMatch_EmptyHeader_DoesNotDisableIMS(t *testing.T) {
-	// A present-but-empty If-None-Match is treated as absent, so a matching
-	// If-Modified-Since must still produce a 304.
 	s := newETagServer(t)
 	rec := doRequest(t, s, http.MethodGet, map[string]string{
 		"If-None-Match":     "",
@@ -3110,8 +3011,6 @@ func TestProxy_Range_IfMatchMismatch_Returns412(t *testing.T) {
 }
 
 func TestProxy_IfRange_MatchButRangeUnsatisfiable_Returns416(t *testing.T) {
-	// If-Range only decides whether Range is honored; an in-date validator
-	// with an out-of-bounds range must still produce 416.
 	s := newETagServer(t)
 	rec := doRequest(t, s, http.MethodGet, map[string]string{
 		"Range":    "bytes=9999-",
@@ -3147,7 +3046,6 @@ func TestProxy_IfUnmodifiedSince_ExactSecondBoundary(t *testing.T) {
 }
 
 func TestProxy_DateFormats(t *testing.T) {
-	// http.ParseTime accepts the three HTTP-date formats of RFC 9110 §5.6.7.
 	formats := []struct {
 		name   string
 		layout string
@@ -3191,9 +3089,7 @@ func TestProxy_DateFormats(t *testing.T) {
 }
 
 func TestCheckPreconditions_ZeroUpdated(t *testing.T) {
-	// Unknown (zero) modification time disables the date conditionals
-	// instead of producing a bogus 304/412. The fake always assigns an
-	// Updated time, so this is exercised at the unit level.
+	// The fake always assigns Updated, so zero Updated is only reachable here.
 	attrs := &storage.ObjectAttrs{Etag: testEtag}
 	cases := []struct {
 		name  string
@@ -3215,8 +3111,6 @@ func TestCheckPreconditions_ZeroUpdated(t *testing.T) {
 	}
 
 	t.Run("If-None-Match still validates", func(t *testing.T) {
-		// ETag validation is independent of the modification time: a match
-		// must 304 even with zero Updated, just without a Last-Modified.
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/x", nil)
 		req.Header.Set("If-None-Match", `"`+testEtag+`"`)
@@ -3373,8 +3267,6 @@ func TestProxy_NotFound_Fallback_IgnoresConditionals(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/missing.txt", nil)
-	// Preconditions apply only to would-be-2xx responses: even validators
-	// matching the 404 page itself must not turn the 404 into a 304/412.
 	req.Header.Set("If-None-Match", `"nf1"`)
 	req.Header.Set("If-Modified-Since", testUpdated.Format(http.TimeFormat))
 	s.handler().ServeHTTP(rec, req)
@@ -3457,8 +3349,6 @@ func TestProxy_WalkUpIndex_Conditional(t *testing.T) {
 }
 
 func TestProxy_GenerationPinnedRead_Smoke(t *testing.T) {
-	// Readers are pinned to the attrs' generation; both reader types must
-	// round-trip the generation parameter through the (fake) GCS API.
 	s := newTestServer(t, []fakestorage.Object{{
 		ObjectAttrs: fakestorage.ObjectAttrs{
 			BucketName: testBucket,
@@ -3536,6 +3426,104 @@ func TestStream_GenerationGone_ReturnsErrGenerationChanged(t *testing.T) {
 			s.handleError(rec, req, err)
 			if rec.Code != http.StatusServiceUnavailable {
 				t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+			}
+		})
+	}
+}
+
+func TestMain_Version(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-version")
+	cmd.Env = append(os.Environ(), "GCSPROXY_RUN_MAIN=1")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("gcsproxy -version: %v", err)
+	}
+	if !strings.HasPrefix(string(out), "gcsproxy ") {
+		t.Errorf("stdout = %q, want prefix %q", out, "gcsproxy ")
+	}
+}
+
+func TestAcceptsGzip(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{"absent", nil, false},
+		{"gzip", []string{"gzip"}, true},
+		{"list", []string{"br, gzip, deflate"}, true},
+		{"case and spaces", []string{"  GZip ;Q=0.5 "}, true},
+		{"x-gzip", []string{"x-gzip"}, true},
+		{"q=0 refuses", []string{"gzip;q=0"}, false},
+		{"q=0.0 refuses", []string{"br, gzip;q=0.0"}, false},
+		{"wildcard", []string{"*"}, true},
+		{"wildcard refused", []string{"*;q=0"}, false},
+		{"explicit gzip beats wildcard", []string{"*, gzip;q=0"}, false},
+		{"explicit gzip beats refused wildcard", []string{"*;q=0, gzip"}, true},
+		{"other codings only", []string{"br, deflate"}, false},
+		{"multiple field lines", []string{"br", "gzip"}, true},
+		{"unparsable q keeps default", []string{"gzip;q=abc"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := acceptsGzip(tc.values); got != tc.want {
+				t.Errorf("acceptsGzip(%q) = %v, want %v", tc.values, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProxy_GzipRefusedByQZero(t *testing.T) {
+	var raw bytes.Buffer
+	zw := gzip.NewWriter(&raw)
+	zw.Write([]byte(testContent))
+	zw.Close()
+	s := newTestServer(t, []fakestorage.Object{{
+		ObjectAttrs: fakestorage.ObjectAttrs{
+			BucketName:      testBucket,
+			Name:            testObject,
+			ContentEncoding: "gzip",
+		},
+		Content: raw.Bytes(),
+	}})
+
+	rec := doRequest(t, s, http.MethodHead, map[string]string{"Accept-Encoding": "gzip;q=0"})
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding = %q, want empty when gzip is refused", got)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Header() http.Header       { return http.Header{} }
+func (failingWriter) WriteHeader(int)           {}
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+func TestCopyBody_LogsFailures(t *testing.T) {
+	cases := []struct {
+		name      string
+		cancel    bool
+		wantLevel string
+	}{
+		{"server-side failure", false, "level=WARN"},
+		{"client went away", true, "level=DEBUG"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			installLogger(t, slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				cancel()
+			}
+			req := httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx)
+			copyBody(failingWriter{}, req, strings.NewReader("body"))
+
+			out := buf.String()
+			if !strings.Contains(out, "response body copy failed") || !strings.Contains(out, tc.wantLevel) {
+				t.Errorf("log output %q, want %q at %s", out, "response body copy failed", tc.wantLevel)
 			}
 		})
 	}

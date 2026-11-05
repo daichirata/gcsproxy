@@ -71,6 +71,7 @@ curl http://localhost:8080/<your-bucket>/<your-object>
 - `/_health` endpoint for liveness and readiness probes
 - Structured logging via `log/slog`, as JSON or text
 - Error responses that hide bucket and object names by default (`-redact-errors`)
+- Request headers must arrive within 10 seconds, so slow-header clients can't tie up connections
 
 ## Installation
 
@@ -123,6 +124,8 @@ Usage of gcsproxy:
   -spa
         SPA fallback: serve -i from the bucket root with HTTP 200 for unmatched routes.
   -v    Show access log.
+  -version
+        Print the version and exit.
   -walk-up-index
         When -i lookup misses, retry parent directories for index files before not-found handling.
 ```

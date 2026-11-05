@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,10 @@ import (
 	"github.com/gorilla/mux"
 	"google.golang.org/api/option"
 )
+
+var version = "dev"
+
+const readHeaderTimeout = 10 * time.Second
 
 type Server struct {
 	addr            string
@@ -64,8 +70,14 @@ func main() {
 		shutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "Max wait for in-flight requests after the idle grace period; 0 waits indefinitely.")
 		redactErrors    = flag.Bool("redact-errors", true, "Replace error response bodies with the generic HTTP status text.")
 		h2c             = flag.Bool("h2c", false, "Enable cleartext HTTP/2 (h2c) with prior knowledge alongside HTTP/1.1.")
+		showVersion     = flag.Bool("version", false, "Print the version and exit.")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("gcsproxy", buildVersion())
+		return
+	}
 
 	level, err := parseLogLevel(*logLevel)
 	if err != nil {
@@ -147,20 +159,17 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("listening", "addr", ln.Addr().String())
+	slog.Info("listening", "addr", ln.Addr().String(), "version", buildVersion())
 	return s.serve(ctx, ln, s.handler())
 }
 
-// serve runs h on ln until ctx is canceled, then executes the phased graceful
-// shutdown: drain (Connection: close) -> close listener -> idle grace ->
-// Shutdown. Idle connections stay open until the idle grace period elapses so
-// clients never race a new request against a server-side close.
 func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) error {
 	tracker := &connTracker{}
 	srv := &http.Server{
-		Handler:   s.drainingHandler(h),
-		ConnState: tracker.connState,
-		Protocols: s.protocols(),
+		Handler:           s.drainingHandler(h),
+		ConnState:         tracker.connState,
+		Protocols:         s.protocols(),
+		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
 	errc := make(chan error, 1)
@@ -172,12 +181,10 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) err
 	case <-ctx.Done():
 	}
 
-	// Phase 1: keep serving; every new response tells clients to stop reusing.
 	s.draining.Store(true)
 	slog.Info("shutdown: draining", "delay", s.shutdownDelay)
 	time.Sleep(s.shutdownDelay)
 
-	// Phase 2: stop accepting new connections. Existing conns keep working.
 	slog.Info("shutdown: closing listener")
 	ln.Close()
 	// Wait for Serve to return so it untracks its listener; otherwise Shutdown
@@ -186,9 +193,6 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) err
 		slog.Warn("shutdown: serve loop exited with error", "err", err)
 	}
 
-	// Phase 3: leave idle connections open; requests on them are still served.
-	// Skip the wait when no connections remain, and end it early once the
-	// last one closes.
 	slog.Info("shutdown: waiting before closing idle connections", "grace", s.idleGracePeriod, "open", tracker.open())
 	select {
 	case <-tracker.noneOpen():
@@ -196,7 +200,6 @@ func (s *Server) serve(ctx context.Context, ln net.Listener, h http.Handler) err
 	case <-time.After(s.idleGracePeriod):
 	}
 
-	// Phase 4: close idle connections, wait for in-flight requests.
 	slog.Info("shutdown: closing idle connections", "timeout", s.shutdownTimeout)
 	sctx := context.Background()
 	if s.shutdownTimeout > 0 {
@@ -219,11 +222,6 @@ func (s *Server) protocols() *http.Protocols {
 	return p
 }
 
-// connTracker counts open server connections via http.Server.ConnState so
-// the shutdown sequence can stop waiting as soon as none remain. Active
-// connections count too: a response whose headers predate the drain flag
-// carries no Connection: close, so its connection can still go idle and be
-// reused by the client.
 type connTracker struct {
 	mu     sync.Mutex
 	count  int
@@ -251,7 +249,6 @@ func (ct *connTracker) open() int {
 	return ct.count
 }
 
-// noneOpen returns a channel that is closed once no connections remain open.
 // Only valid after the listener stopped accepting new connections, since the
 // count never rises again from zero.
 func (ct *connTracker) noneOpen() <-chan struct{} {
@@ -266,10 +263,6 @@ func (ct *connTracker) noneOpen() <-chan struct{} {
 	return ch
 }
 
-// drainingHandler marks every response written after shutdown begins with
-// Connection: close, so keep-alive clients stop reusing the connection.
-// net/http then closes the connection after the response completes. Over
-// HTTP/2 the header is stripped and the server sends GOAWAY instead.
 func (s *Server) drainingHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.draining.Load() {
@@ -326,8 +319,6 @@ func (s *Server) wrap(fn http.HandlerFunc) http.HandlerFunc {
 func (s *Server) proxy(w http.ResponseWriter, r *http.Request, bucket, object string) {
 	err := s.proxyOnce(w, r, bucket, object)
 	if errors.Is(err, errGenerationChanged) {
-		// Nothing has been written yet: start over from fresh attrs so the
-		// preconditions and range are evaluated against the new generation.
 		slog.DebugContext(r.Context(), "retrying request", "url", r.URL.String(), "err", err)
 		err = s.proxyOnce(w, r, bucket, object)
 	}
@@ -440,8 +431,6 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, obj
 	if err != nil {
 		return err
 	}
-	// Preconditions apply only to would-be-2xx responses (RFC 9110 §13.2.1):
-	// the SPA fallback revalidates, the -not-found 404 page never does.
 	if status == http.StatusOK && checkPreconditions(w, r, attrs) {
 		return nil
 	}
@@ -449,7 +438,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, obj
 }
 
 func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs, status int) error {
-	gzipAcceptable := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+	gzipAcceptable := acceptsGzip(r.Header.Values("Accept-Encoding"))
 
 	// Open the reader before setting any header so that a failure leaves the
 	// response clean for handleError.
@@ -470,8 +459,6 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 	setStrHeader(w, "Cache-Control", attrs.CacheControl)
 	setStrHeader(w, "Content-Disposition", attrs.ContentDisposition)
 	if gzipStored(attrs) {
-		// The gzip and GCS-transcoded variants share this URL, so caches
-		// must key on the request's Accept-Encoding.
 		setStrHeader(w, "Vary", "Accept-Encoding")
 	} else {
 		setStrHeader(w, "Accept-Ranges", "bytes")
@@ -500,7 +487,7 @@ func (s *Server) streamObject(w http.ResponseWriter, r *http.Request, attrs *sto
 	}
 
 	w.WriteHeader(status)
-	io.Copy(w, objr)
+	copyBody(w, r, objr)
 	return nil
 }
 
@@ -557,8 +544,44 @@ func (s *Server) streamRange(w http.ResponseWriter, r *http.Request, attrs *stor
 	setStrHeader(w, "Content-Encoding", objr.Attrs.ContentEncoding)
 
 	w.WriteHeader(http.StatusPartialContent)
-	io.Copy(w, objr)
+	copyBody(w, r, objr)
 	return nil
+}
+
+func copyBody(w http.ResponseWriter, r *http.Request, objr io.Reader) {
+	if _, err := io.Copy(w, objr); err != nil {
+		level := slog.LevelWarn
+		if r.Context().Err() != nil {
+			level = slog.LevelDebug
+		}
+		slog.Log(r.Context(), level, "response body copy failed", "url", r.URL.String(), "err", err)
+	}
+}
+
+func acceptsGzip(values []string) bool {
+	gzipQ, anyQ := -1.0, -1.0
+	for _, v := range values {
+		for _, member := range strings.Split(v, ",") {
+			coding, params, err := mime.ParseMediaType(member)
+			if err != nil && !errors.Is(err, mime.ErrInvalidMediaParameter) {
+				continue
+			}
+			q := 1.0
+			if f, err := strconv.ParseFloat(params["q"], 64); err == nil {
+				q = f
+			}
+			switch coding {
+			case "gzip", "x-gzip":
+				gzipQ = max(gzipQ, q)
+			case "*":
+				anyQ = max(anyQ, q)
+			}
+		}
+	}
+	if gzipQ >= 0 {
+		return gzipQ > 0
+	}
+	return anyQ > 0
 }
 
 var (
@@ -579,7 +602,6 @@ func parseSingleRange(header string, size int64) (start, length int64, err error
 	startStr, endStr := spec[:dash], spec[dash+1:]
 
 	if startStr == "" {
-		// Suffix range: -N → last N bytes.
 		n, perr := strconv.ParseInt(endStr, 10, 64)
 		if perr != nil || n <= 0 {
 			return 0, 0, errRangeIgnore
@@ -618,8 +640,6 @@ func parseSingleRange(header string, size int64) (start, length int64, err error
 
 var errGenerationChanged = errors.New("object generation changed during request")
 
-// objectHandle pins reads to the generation the validators were derived from,
-// so a concurrent overwrite cannot pair a new body with them.
 func (s *Server) objectHandle(attrs *storage.ObjectAttrs) *storage.ObjectHandle {
 	obj := s.client.Bucket(attrs.Bucket).Object(attrs.Name)
 	if attrs.Generation != 0 {
@@ -628,8 +648,6 @@ func (s *Server) objectHandle(attrs *storage.ObjectAttrs) *storage.ObjectHandle 
 	return obj
 }
 
-// pinnedReadErr turns a not-found from a generation-pinned read into
-// errGenerationChanged, so the request is retried instead of answering 404.
 func pinnedReadErr(attrs *storage.ObjectAttrs, err error) error {
 	if attrs.Generation != 0 && errors.Is(err, storage.ErrObjectNotExist) {
 		return fmt.Errorf("%w (generation %d)", errGenerationChanged, attrs.Generation)
@@ -637,15 +655,10 @@ func pinnedReadErr(attrs *storage.ObjectAttrs, err error) error {
 	return err
 }
 
-// gzip-stored objects are subject to GCS decompressive transcoding on download.
 func gzipStored(attrs *storage.ObjectAttrs) bool {
 	return strings.EqualFold(attrs.ContentEncoding, "gzip")
 }
 
-// gzip-stored objects get a weak tag because the same URL serves two
-// byte-different representations (raw gzip vs GCS-transcoded) depending on
-// the request's Accept-Encoding; the variants are semantically equivalent,
-// which is exactly what a weak tag promises.
 func objectETag(attrs *storage.ObjectAttrs) string {
 	if attrs.Etag == "" {
 		return ""
@@ -656,10 +669,7 @@ func objectETag(attrs *storage.ObjectAttrs) string {
 	return `"` + attrs.Etag + `"`
 }
 
-// scanETag determines if a syntactically valid ETag is present at the start
-// of s (RFC 9110 §8.8.3). If so, it returns the ETag (including quotes and
-// any W/ prefix) and the remaining text after it; otherwise ("", "").
-// Ported from net/http/fs.go.
+// Ported from net/http/fs.go (RFC 9110 §8.8.3).
 func scanETag(s string) (etag string, remain string) {
 	s = textproto.TrimString(s)
 	start := 0
@@ -691,8 +701,6 @@ func etagWeakMatch(a, b string) bool {
 	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")
 }
 
-// A present-but-empty If-Match/If-None-Match field is treated as absent rather
-// than as a failing precondition, matching net/http semantics.
 func hasETagValues(values []string) bool {
 	for _, v := range values {
 		if textproto.TrimString(v) != "" {
@@ -702,8 +710,6 @@ func hasETagValues(values []string) bool {
 	return false
 }
 
-// "*" matches any existing representation. A malformed member ends scanning
-// of that value, treating the rest as no-match, like net/http/fs.go.
 func anyETagMatches(values []string, target string, strong bool) bool {
 	match := etagWeakMatch
 	if strong {
@@ -735,9 +741,6 @@ func anyETagMatches(values []string, target string, strong bool) bool {
 	return false
 }
 
-// 304 carries the validator headers the equivalent 200 would (RFC 9110
-// §15.4.5); representation headers (Content-Type, Content-Length, ...) are
-// deliberately omitted.
 func writeNotModified(w http.ResponseWriter, attrs *storage.ObjectAttrs) {
 	setStrHeader(w, "ETag", objectETag(attrs))
 	setTimeHeader(w, "Last-Modified", attrs.Updated)
@@ -748,9 +751,6 @@ func writeNotModified(w http.ResponseWriter, attrs *storage.ObjectAttrs) {
 	w.WriteHeader(http.StatusNotModified)
 }
 
-// checkPreconditions follows the evaluation order of RFC 9110 §13.2.2 and
-// reports whether it has written a 412 or 304. Invalid HTTP-dates and unknown
-// (zero) modification times disable the date-based checks.
 func checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.ObjectAttrs) bool {
 	if ifMatch := r.Header.Values("If-Match"); hasETagValues(ifMatch) {
 		if !anyETagMatches(ifMatch, objectETag(attrs), true) {
@@ -772,8 +772,6 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.O
 			writeNotModified(w, attrs)
 			return true
 		}
-		// If-None-Match present but unmatched: If-Modified-Since MUST be
-		// ignored (RFC 9110 §13.1.3).
 		return false
 	}
 
@@ -791,8 +789,6 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, attrs *storage.O
 	return false
 }
 
-// If-Range (RFC 9110 §13.1.5): an entity-tag must strong-match, so weak tags
-// never do; an HTTP-date must equal Last-Modified exactly.
 func ifRangeAllowsPartial(r *http.Request, attrs *storage.ObjectAttrs) bool {
 	ir, ok := header(r, "If-Range")
 	if !ok || ir == "" {
@@ -870,6 +866,16 @@ type wrapResponseWriter struct {
 func (w *wrapResponseWriter) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 	w.status = status
+}
+
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
 }
 
 func fatal(msg string, args ...any) {
