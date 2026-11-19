@@ -3,11 +3,11 @@ module github.com/daichirata/gcsproxy
 go 1.27.0
 
 require (
-	cloud.google.com/go/auth v0.24.2
+	cloud.google.com/go/auth v0.24.4
 	cloud.google.com/go/storage v1.70.0
 	github.com/fsouza/fake-gcs-server v1.56.1
 	github.com/gorilla/mux v1.8.1
-	google.golang.org/api v0.311.0
+	google.golang.org/api v0.313.0
 )
 
 require (
@@ -50,8 +50,8 @@ require (
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/oauth2 v0.37.0 // indirect
-	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/oauth2 v0.38.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
